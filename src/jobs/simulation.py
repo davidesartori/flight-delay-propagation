@@ -1,19 +1,20 @@
-from pyspark.sql import SparkSession, functions as F
+"""Flight delay propagation simulation."""
+
+import argparse
+import yaml
+from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark import SparkContext, StorageLevel
+from pyspark import StorageLevel
+from src.utils.spark import create_spark_session
 
-spark = (
-    SparkSession.builder
-    .appName("Simulator")
-    .getOrCreate()
-)
-
-sc = SparkContext.getOrCreate()
-sc.setCheckpointDir("checkpoint_dir")
+spark_session = create_spark_session(app_name="Simulation")
+spark_session.sparkContext.setCheckpointDir("checkpoint_dir")
 
 FLIGHT_SEPARATION = 2  # minutes between takeoffs at same airport
 DEFAULT_TURNAROUND = 45  # plane turnaround time
 CHECKPOINT_EVERY = 60
+T_START = 0
+T_MAX = 2880  # 2 days in minutes
 
 
 def parse_hhmm_to_minutes(col):
@@ -95,8 +96,8 @@ def build_info_and_state(flights_df):
             "is_departed": False,
         }))
 
-    flight_info_bc = sc.broadcast(flight_info)
-    state_rdd = sc.parallelize(flight_state)
+    flight_info_bc = spark_session.sparkContext.broadcast(flight_info)
+    state_rdd = spark_session.sparkContext.parallelize(flight_state)
 
     return flight_info_bc, state_rdd
 
@@ -167,7 +168,7 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
     influence_bc = None
 
     if use_influence:
-        influence_bc = sc.broadcast(influence_score_map)
+        influence_bc = spark_session.sparkContext.broadcast(influence_score_map)
 
     state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
 
@@ -209,14 +210,21 @@ if __name__ == "__main__":
         "ATL": 52, "ORD": 57, "DFW": 52
     }
 
-    raw_flights_df = spark.read.csv(
-        "dataset/flights.csv", header=True, inferSchema=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    raw_flights_df = spark_session.read.csv(
+        config["input"]["flights"], header=True, inferSchema=True)
 
     flights_df = process_raw_flights(raw_flights_df, year=2015, month=8, day=2)
     flights_df = flights_df.persist()
 
     final_state, flight_info_bc = run_simulation(
-        flights_df, influence_score_map, t0=0, t_end=2880, use_influence=False
+        flights_df, influence_score_map, t0=T_START, t_end=T_MAX, use_influence=False
     )
 
     remaining_flights = final_state.filter(

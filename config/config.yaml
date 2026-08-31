@@ -1,0 +1,6 @@
+input:
+  flights: "dataset/flights.csv"
+
+output:
+  simulation: "output/sim_result.txt"
+  training: "output/influence_scores.csv"
