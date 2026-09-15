@@ -1,6 +1,10 @@
 input:
   flights: "dataset/flights.csv"
+  influence: "dataset/influence_scores.csv"
 
 output:
   simulation: "output/sim_result.txt"
   training: "output/influence_scores.csv"
+
+training:
+  workers: 10

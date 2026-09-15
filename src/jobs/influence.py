@@ -1,4 +1,5 @@
 """Training script for calculating influence scores of airports."""
+import logging
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -7,18 +8,54 @@ import math
 from pyspark.sql import functions as F
 import yaml
 from src.utils.spark import create_spark_session
+from src.utils.logging import setup_logging
 
-spark_session, logger, _ = create_spark_session(app_name="Training")
+logger = logging.getLogger(__name__)
 
-MAX_WORKERS = 10
+spark_session = create_spark_session(app_name="Training")
+
 EPSILON = 0.1
 MAX_EPOCHS = 3
 DELAY_THRESHOLD = 15
 
 
+def create_graph(data):
+    """Create a directed graph from the flight data with delay probabilities."""
+    route_delay_probability = (
+        data
+        .withColumn("is_delayed", F.when(F.col("DEPARTURE_DELAY") >
+                                         DELAY_THRESHOLD, 1).otherwise(0))
+        .groupBy("ORIGIN_AIRPORT", "DESTINATION_AIRPORT")
+        .agg(
+            F.count("*").alias("n_flights"),
+            F.sum("is_delayed").alias("n_delayed")
+        )
+        .withColumn("delay_ratio", F.col("n_delayed") / F.col("n_flights"))
+    )
+
+    edges = route_delay_probability.select(
+        "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "delay_ratio"
+    ).collect()
+
+    graph = defaultdict(list)
+
+    for row in edges:
+        origin = row["ORIGIN_AIRPORT"]
+        dest = row["DESTINATION_AIRPORT"]
+        prob = row["delay_ratio"]
+        graph[origin].append((dest, prob))
+
+    graph = {
+        origin: sorted(neighbors, key=lambda x: x[1], reverse=True)
+        for origin, neighbors in graph.items()
+    }
+
+    return graph
+
+
 def infect(current_node, graph_bc, t):
     """Simulate the infection process for a given node"""
-    (sample_id, u), status = current_node
+    (sample_id, u), _ = current_node
     graph = graph_bc.value
     out_neighbors = graph.get(u, [])[:t]  # max t neighbors
 
@@ -41,14 +78,14 @@ def merge_labels(label1, label2):
 
 def sample_oracle(graph_bc, s, l, t, max_epochs):
     """Run the sampling oracle to estimate influence"""
-    # Initialization
     infected_nodes_list = [
         ((sample_id, node), "new")
         for sample_id in range(l)
         for node in s
     ]
 
-    infected_nodes_rdd = spark_session.sparkContext.parallelize(infected_nodes_list)
+    infected_nodes_rdd = spark_session.sparkContext.parallelize(
+        infected_nodes_list)
 
     incomplete_samples = set(range(l))
     r_t = {}
@@ -121,7 +158,10 @@ def inf_est(graph_bc, s, n, epsilon, max_epochs):
     return 1
 
 
-if __name__ == "__main__":
+def main():
+    """Main function to run the training script."""
+    setup_logging()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
@@ -129,42 +169,17 @@ if __name__ == "__main__":
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    max_workers = config["training"]["workers"]
+
     file = config["input"]["flights"]
     data = spark_session.read.format("csv")\
         .option("header", "true")\
         .option("inferSchema", "true")\
         .load(file)
 
-    route_delay_probability = (
-        data
-        .withColumn("is_delayed", F.when(F.col("DEPARTURE_DELAY") > DELAY_THRESHOLD, 1).otherwise(0))
-        .groupBy("ORIGIN_AIRPORT", "DESTINATION_AIRPORT")
-        .agg(
-            F.count("*").alias("n_flights"),
-            F.sum("is_delayed").alias("n_delayed")
-        )
-        .withColumn("delay_ratio", F.col("n_delayed") / F.col("n_flights"))
-    )
-
-    edges = route_delay_probability.select(
-        "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "delay_ratio"
-    ).collect()
-
-    graph = defaultdict(list)
-
-    for row in edges:
-        origin = row["ORIGIN_AIRPORT"]
-        dest = row["DESTINATION_AIRPORT"]
-        prob = row["delay_ratio"]
-        graph[origin].append((dest, prob))
-
-    graph = {
-        origin: sorted(neighbors, key=lambda x: x[1], reverse=True)
-        for origin, neighbors in graph.items()
-    }
+    graph = create_graph(data)
 
     graph_broadcast = spark_session.sparkContext.broadcast(graph)
-
 
     spark_session.sparkContext.setLocalProperty("spark.scheduler.mode", "FAIR")
     n = len(graph_broadcast.value)
@@ -172,6 +187,7 @@ if __name__ == "__main__":
     airports = list(graph_broadcast.value.keys())
     influence_scores = {}
 
+    logger.info("Starting influence estimation for %d airports with %d workers", len(airports), max_workers)
 
     def run_single(airport):
         """Run the influence estimation for a single airport."""
@@ -179,21 +195,25 @@ if __name__ == "__main__":
         score = inf_est(graph_broadcast, s, n, EPSILON, max_epochs=MAX_EPOCHS)
         return airport, score
 
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(run_single, airport): airport for airport in airports}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(run_single, airport)
+                                   : airport for airport in airports}
 
         for future in as_completed(futures):
             airport = futures[future]
             try:
                 airport_result, score = future.result()
+                logger.info("Airport: %s, Influence Score: %s (%d/%d)", airport_result, score, len(influence_scores), n)
                 influence_scores[airport_result] = score
-                print(f"{airport_result}: {score:.3f}  ({len(influence_scores)}/{n})")
             except Exception as e:
-                print(f"ERRORE su {airport}: {e}")
+                logger.error("Error with %s: %s", airport, e)
 
     output_file = config["output"]["training"]
     with open(output_file, "w", encoding="utf-8") as f:
-        f.write("airport,influence_score\n")
+        f.write("airport,score\n")
         for airport, score in influence_scores.items():
             f.write(f"{airport},{score}\n")
+
+
+if __name__ == "__main__":
+    main()

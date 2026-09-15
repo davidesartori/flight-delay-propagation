@@ -1,11 +1,16 @@
 """Flight delay propagation simulation."""
 
+import logging
 import argparse
 import yaml
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark import StorageLevel
+from src.utils.io import load__influence_scores
 from src.utils.spark import create_spark_session
+from src.utils.logging import setup_logging
+
+logger = logging.getLogger(__name__)
 
 spark_session = create_spark_session(app_name="Simulation")
 spark_session.sparkContext.setCheckpointDir("checkpoint_dir")
@@ -15,6 +20,7 @@ DEFAULT_TURNAROUND = 45  # plane turnaround time
 CHECKPOINT_EVERY = 60
 T_START = 0
 T_MAX = 2880  # 2 days in minutes
+INFLUENCE_RATE = 5  # influence factor for delay propagation
 
 
 def parse_hhmm_to_minutes(col):
@@ -102,22 +108,43 @@ def build_info_and_state(flights_df):
     return flight_info_bc, state_rdd
 
 
+def get_magnitude(flight_info_bc, state_rdd, t):
+    """Calculate the magnitude of delays at each airport."""
+    state_rdd = state_rdd.filter(
+        lambda flight: flight[1]["is_departed"] is True and flight[1]["departure_time"] < t and
+        flight[1]["departure_time"] >= t-60)
+    delay_time_per_airport = state_rdd.map(lambda flight:
+                                           (flight_info_bc.value[flight[0]]["origin"],
+                                            max(flight[1]["departure_time"] -
+                                                flight[1]["scheduled_departure"],
+                                                0))).reduceByKey(lambda a, b:
+                                                                 (a + b)).filter(lambda item:
+                                                                                 item[1] != 0)
+
+    delay_count_per_airport = state_rdd.map(lambda flight: (flight_info_bc.value[flight[0]]["origin"],
+                                                            1 if flight[1]["departure_time"] -
+                                                            flight[1]["scheduled_departure"] >= 1 else
+                                                            0)).reduceByKey(lambda a, b:
+                                                                            (a + b)).filter(lambda item: item[1] != 0)
+
+    return delay_count_per_airport, delay_time_per_airport
+
+
 def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influence=True):
     """Run the flight delay propagation simulation."""
     def resolve_group(item, t):
-        origin, flights = item
+        _, flights = item
         flights = list(flights)
-
-        if len(flights) > 1:
-            print(str(len(flights)) +
-                  " flights waiting for departure at " + origin + " airport")
 
         def priority_key(fs):
             flight_id, state = fs
-            # destination = flight_info_bc.value[flight_id]["destination"]
-            # influence = influence_bc.value.get(destination, 0) if influence_bc else 0
+            destination = flight_info_bc.value[flight_id]["destination"]
+            influence = influence_bc.value.get(
+                destination, 0) if influence_bc else 0
             delay = state["delay"]
-            priority = delay
+            priority = delay if delay > 0 else 1
+            if influence > 0 and delay > 0:
+                priority *= (1 + INFLUENCE_RATE * ((influence - 1) / 99)**2)
             return priority
 
         winner_id, _ = max(flights, key=priority_key)
@@ -128,9 +155,8 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
                 info = flight_info_bc.value[flight_id]
                 new_state = dict(state)
                 new_state["is_departed"] = True
+                new_state["departure_time"] = t
                 updates.append((flight_id, new_state))
-                print("Aircraft " + flight_id.split("_")[0] + " leg " + flight_id.split("_")[1] +
-                      " departed from " + info["origin"] + " at time t: " + str(t))
 
                 # unlock next leg if it exists
                 if info["next_flight_id"] is not None:
@@ -138,28 +164,66 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
                     updates.append((next_flight_id, {"scheduled_departure": 0,
                                                      "delay": 0,
                                                      "is_departed": False,
-                                                     "ready_time": t +
-                                                     info["scheduled_flying_time"] +
-                                                     DEFAULT_TURNAROUND}))
+                                                     "ready_time": t + info["scheduled_flying_time"] + DEFAULT_TURNAROUND}))
             else:
                 new_state = dict(state)
                 additional_delay = 1 if FLIGHT_SEPARATION <= 6 else 0
                 new_state["delay"] = max(
-                    0, FLIGHT_SEPARATION + t - (state["scheduled_departure"] +
-                                                state["delay"])) + additional_delay
+                    0, FLIGHT_SEPARATION + t - (state["scheduled_departure"] + state["delay"])) + additional_delay
                 updates.append((flight_id, new_state))
+
+        return updates
+
+    def resolve_landing_group(item, t):
+        _, flights = item
+        flights = list(flights)
+        updates = []
+
+        def priority_key(fs):
+            flight_id, state = fs
+            next_flight = flight_info_bc.value[flight_id]["next_flight_id"]
+
+            delay = state["delay"]
+            priority = delay if delay > 0 else 1
+
+            if next_flight is not None:
+                next_flight_info = flight_info_bc.value[next_flight]
+                influence = influence_bc.value.get(next_flight_info["destination"],
+                                                   0) if influence_bc else 0
+                priority = delay if delay > 0 else 1
+                if influence > 0 and delay > 0:
+                    priority *= (1 + INFLUENCE_RATE *
+                                 ((influence - 1) / 99)**2)
+
+            return priority
+
+        winner_id, _ = max(flights, key=priority_key)
+
+        for flight_id, _ in flights:
+            if flight_id != winner_id:
+                info = flight_info_bc.value[flight_id]
+
+                if info["next_flight_id"] is not None:
+                    next_flight_id = info["next_flight_id"]
+
+                    updates.append((next_flight_id, {"scheduled_departure": 0,
+                                                     "delay": FLIGHT_SEPARATION,
+                                                     "is_departed": False,
+                                                     "ready_time": None}))
 
         return updates
 
     def merge_states(a, b):
         state = dict(a)
 
-        state["scheduled_departure"] = max(
-            a.get("scheduled_departure"), b.get("scheduled_departure"))
+        state["scheduled_departure"] = max(a.get("scheduled_departure"),
+                                           b.get("scheduled_departure"))
         state["delay"] = (a.get("delay") or 0) + (b.get("delay") or 0)
         state["is_departed"] = a.get("is_departed") or b.get("is_departed")
-        state["ready_time"] = max(
-            (a.get("ready_time") or 0), (b.get("ready_time") or 0))
+        state["ready_time"] = max((a.get("ready_time") or 0),
+                                  (b.get("ready_time") or 0))
+        state["departure_time"] = max((a.get("departure_time") or 0),
+                                      (b.get("departure_time") or 0))
 
         return state
 
@@ -168,7 +232,8 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
     influence_bc = None
 
     if use_influence:
-        influence_bc = spark_session.sparkContext.broadcast(influence_score_map)
+        influence_bc = spark_session.sparkContext.broadcast(
+            influence_score_map)
 
     state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
 
@@ -177,38 +242,48 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
 
     t = t0
     while not_departed.count() > 0 and t < t_end:
-        candidates = not_departed.filter(
+        departing_candidates = not_departed.filter(
             lambda flight:
-            flight[1]["scheduled_departure"] + flight[1]["delay"] <= t +
-            min(FLIGHT_SEPARATION - 1, 5) and
+            flight[1]["scheduled_departure"] + flight[1]["delay"] <= t + min(FLIGHT_SEPARATION - 1, 5) and
             flight[1]["ready_time"] is not None and
             flight[1]["ready_time"] <= t
         )
-
-        candidates = candidates.map(lambda candidate: (
+        departing_candidates = departing_candidates.map(lambda candidate: (
             flight_info_bc.value[candidate[0]]["origin"], candidate)).groupByKey()
+        resolved = departing_candidates.flatMap(
+            lambda item: resolve_group(item, t))
 
-        resolved = candidates.flatMap(lambda item: resolve_group(item, t))
+        landing_conflicts = state_rdd.filter(lambda flight: flight[1]["is_departed"] is True and
+                                             t == flight[1]["departure_time"] + flight_info_bc.value[flight[0]]["scheduled_flying_time"])
 
-        state_rdd = state_rdd.union(resolved).reduceByKey(
-            merge_states, numPartitions=10)
+        landing_conflicts = landing_conflicts.map(lambda conflict: (
+            flight_info_bc.value[conflict[0]]["destination"], conflict)).groupByKey()
+
+        resolved_landing = landing_conflicts.flatMap(
+            lambda item: resolve_landing_group(item, t))
+
+        state_rdd = state_rdd.union(resolved).union(
+            resolved_landing).reduceByKey(merge_states, numPartitions=10)
 
         if (t - t0) % CHECKPOINT_EVERY == 0:
             state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
             state_rdd.checkpoint()
             state_rdd.count()
 
+        if (t - t0) % 60 == 0 and t > t0:
+            dp_mag1, dp_mag2 = get_magnitude(flight_info_bc, state_rdd, t)
+            # TODO: save data to database
+
         not_departed = state_rdd.filter(
             lambda flight: flight[1]["is_departed"] is False)
         t += 1
 
-    return state_rdd, flight_info_bc
+    return state_rdd
 
 
-if __name__ == "__main__":
-    influence_score_map = {
-        "ATL": 52, "ORD": 57, "DFW": 52
-    }
+def main():
+    """Main function to run the flight delay propagation simulation."""
+    setup_logging()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -217,16 +292,26 @@ if __name__ == "__main__":
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    logger.info("Loading influence scores")
+
+    influence_scores = load__influence_scores(config["input"]["influence"])
+
     raw_flights_df = spark_session.read.csv(
         config["input"]["flights"], header=True, inferSchema=True)
 
     flights_df = process_raw_flights(raw_flights_df, year=2015, month=8, day=2)
     flights_df = flights_df.persist()
 
-    final_state, flight_info_bc = run_simulation(
-        flights_df, influence_score_map, t0=T_START, t_end=T_MAX, use_influence=False
-    )
+    logger.info("Starting simulation")
+
+    final_state = run_simulation(
+        flights_df, influence_scores, t0=T_START, t_end=T_MAX, use_influence=True)
 
     remaining_flights = final_state.filter(
         lambda x: x[1]["is_departed"] is False)
-    print(remaining_flights.take(10))
+
+    logger.info("Simulation completed. Remaining flights: %s", remaining_flights.count())
+
+
+if __name__ == "__main__":
+    main()
