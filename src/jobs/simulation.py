@@ -1,5 +1,6 @@
 """Flight delay propagation simulation."""
 
+import threading
 import logging
 import argparse
 import yaml
@@ -9,6 +10,8 @@ from pyspark import StorageLevel
 from src.utils.io import load__influence_scores
 from src.utils.spark import create_spark_session
 from src.utils.logging import setup_logging
+from src.simulation.delay_generator import generate_random_delay_files
+from src.simulation.delay_stream import start_delay_stream, consume_pending_delays
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,13 @@ def parse_hhmm_to_minutes(col):
     hh = F.substring(s, 1, 2).cast("int")
     mm = F.substring(s, 3, 2).cast("int")
     return (hh % 24) * 60 + mm
+
+
+def convert_minutes_to_hhmm(minutes):
+    """Convert minutes since midnight to HHMM time format."""
+    hh = (minutes // 60) % 24
+    mm = minutes % 60
+    return f"{hh:02d}:{mm:02d}"
 
 
 def process_raw_flights(raw_df, year, month, day):
@@ -130,7 +140,8 @@ def get_magnitude(flight_info_bc, state_rdd, t):
     return delay_count_per_airport, delay_time_per_airport
 
 
-def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influence=True):
+def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influence=False, use_delay_streaming=False,
+                   delay_streaming_dir="delay_streaming", delay_interval_sec=10, delay_probability=0.001, delay_range=(5, 30)):
     """Run the flight delay propagation simulation."""
     def resolve_group(item, t):
         _, flights = item
@@ -229,6 +240,20 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
 
     flight_info_bc, state_rdd = build_info_and_state(flights_df)
 
+    if use_delay_streaming:
+        airports = flights_df.select("origin").distinct().rdd.flatMap(lambda x: x).collect()
+
+        stop_event = threading.Event()
+        generator_thread = threading.Thread(
+            target=generate_random_delay_files,
+            args=(airports, delay_streaming_dir, delay_interval_sec, delay_probability, delay_range),
+            kwargs={"stop_event": stop_event},
+            daemon=True,
+        )
+        generator_thread.start()
+
+        stream_query, delay_buffer, buffer_lock = start_delay_stream(spark_session, delay_streaming_dir)
+
     influence_bc = None
 
     if use_influence:
@@ -242,6 +267,30 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
 
     t = t0
     while not_departed.count() > 0 and t < t_end:
+        if use_delay_streaming:
+            pending_delays = consume_pending_delays(delay_buffer, buffer_lock)
+
+            if pending_delays:
+                for airport, delay in pending_delays.items():
+                    affected_flights = not_departed.filter(
+                            lambda flight, airport=airport, delay=delay: flight_info_bc.value[flight[0]]["origin"] == airport and
+                            flight[1]["ready_time"] is not None and
+                            flight[1]["ready_time"] <= t + delay and
+                            flight[1]["scheduled_departure"] + flight[1]["delay"] <= t + delay and
+                            flight[1]["scheduled_departure"] + flight[1]["delay"] >= t)
+
+                    if affected_flights.count() > 0:
+                        logger.info("Applying delay of %d minutes to %d flights at airport %s at time %s",
+                                    delay, affected_flights.count(), airport, convert_minutes_to_hhmm(t))
+
+                        affected_flights = affected_flights.map(lambda flight, delay=delay: (
+                                flight[0], {
+                                    **flight[1],
+                                    "delay": (t + delay) - (flight[1]["scheduled_departure"] + flight[1]["delay"]),
+                                }))
+
+                        not_departed = not_departed.subtractByKey(affected_flights).union(affected_flights)
+
         departing_candidates = not_departed.filter(
             lambda flight:
             flight[1]["scheduled_departure"] + flight[1]["delay"] <= t + min(FLIGHT_SEPARATION - 1, 5) and
@@ -278,6 +327,10 @@ def run_simulation(flights_df, influence_score_map, t0=0, t_end=1440, use_influe
             lambda flight: flight[1]["is_departed"] is False)
         t += 1
 
+    if use_delay_streaming:
+        stop_event.set()
+        stream_query.stop()
+
     return state_rdd
 
 
@@ -304,8 +357,17 @@ def main():
 
     logger.info("Starting simulation")
 
+    use_delay_streaming = config["simulation"].get("delay_streaming", False)
+    delay_streaming_dir = config["delay_streaming"].get("input_dir", "delay_streaming")
+    delay_interval_sec = config["delay_streaming"].get("interval_sec", 10)
+    delay_probability = config["delay_streaming"].get("probability", 0.001)
+    delay_range = tuple(config["delay_streaming"].get("delay_range", (5, 30)))
+
     final_state = run_simulation(
-        flights_df, influence_scores, t0=T_START, t_end=T_MAX, use_influence=True)
+        flights_df, influence_scores, t0=T_START, t_end=T_MAX, use_influence=True,
+        use_delay_streaming=use_delay_streaming, delay_streaming_dir=delay_streaming_dir,
+        delay_interval_sec=delay_interval_sec, delay_probability=delay_probability,
+        delay_range=delay_range)
 
     remaining_flights = final_state.filter(
         lambda x: x[1]["is_departed"] is False)

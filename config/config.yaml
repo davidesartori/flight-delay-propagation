@@ -8,3 +8,12 @@ output:
 
 training:
   workers: 10
+
+simulation:
+  delay_streaming: true
+
+delay_streaming:
+  input_dir: "delay_streaming"
+  interval_sec: 10
+  probability: 0.001
+  delay_range: [5, 30]
