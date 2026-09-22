@@ -16,3 +16,9 @@ def load__influence_scores(path: str) -> dict:
             scores[row["airport"]] = float(row["score"])
 
     return scores
+
+
+def save_output(path: str, text: str):
+    """Write output to file"""
+    with open(path, "w", newline="\n", encoding="utf-8") as f:
+        f.write(text)

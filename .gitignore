@@ -1,4 +1,6 @@
 checkpoint_dir/
 delay_streaming/
+output/
 *.pyc
-
+secrets/
+.env

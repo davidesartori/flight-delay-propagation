@@ -10,7 +10,12 @@ training:
   workers: 10
 
 simulation:
+  day: 2
+  month: 8
+  year: 2015
+  influence: true
   delay_streaming: true
+  write_events: true
 
 delay_streaming:
   input_dir: "delay_streaming"

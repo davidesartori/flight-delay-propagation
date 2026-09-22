@@ -1,0 +1,58 @@
+services:
+  influxdb:
+    image: influxdb:3-core
+    container_name: influxdb
+    ports:
+      - "8181:8181"
+    volumes:
+      - influxdb-data:/var/lib/influxdb3
+    command:
+      - influxdb3
+      - serve
+      - --node-id=node0
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8181/ping | grep -qE '^(200|401)$'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  influxdb-init:
+    image: influxdb:3-core
+    container_name: influxdb-init
+    entrypoint: ["/bin/bash", "/init/init.sh"]
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      - INFLUXDB_HOST=http://influxdb:8181
+      - INFLUX_DB_NAME=flight-delay-propagation
+    volumes:
+      - ./init/init.sh:/init/init.sh:ro
+      - internal-state:/internal
+      - ./secrets:/hostenv
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    container_name: grafana
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - internal-state:/etc/grafana/provisioning/datasources
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    restart: unless-stopped
+
+volumes:
+  influxdb-data:
+  grafana-data:
+  internal-state:
