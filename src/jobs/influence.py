@@ -12,8 +12,6 @@ from src.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
-spark_session = create_spark_session(app_name="Training")
-
 EPSILON = 0.1
 MAX_EPOCHS = 3
 DELAY_THRESHOLD = 15
@@ -76,7 +74,7 @@ def merge_labels(label1, label2):
     return "new"
 
 
-def sample_oracle(graph_bc, s, l, t, max_epochs):
+def sample_oracle(spark_session, graph_bc, s, l, t, max_epochs):
     """Run the sampling oracle to estimate influence"""
     infected_nodes_list = [
         ((sample_id, node), "new")
@@ -128,14 +126,14 @@ def sample_oracle(graph_bc, s, l, t, max_epochs):
     return n_over_threshold / l
 
 
-def verify_guess(graph_bc, s, n, tau, epsilon, max_epochs):
+def verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs):
     """Verify the guess of influence"""
     t = tau
     total = 0.0
 
     while t <= n:
         l = max(10, math.ceil(8 * t * (math.log(n) ** 3) / (tau ** 2)))
-        pi_t_l = sample_oracle(graph_bc, s, l, int(round(t)), max_epochs)
+        pi_t_l = sample_oracle(spark_session, graph_bc, s, l, int(round(t)), max_epochs)
         total += (epsilon / (1 + epsilon)) * t * pi_t_l
 
         if total >= (1 - 2 * epsilon) * tau:
@@ -146,12 +144,12 @@ def verify_guess(graph_bc, s, n, tau, epsilon, max_epochs):
     return 0
 
 
-def inf_est(graph_bc, s, n, epsilon, max_epochs):
+def inf_est(spark_session, graph_bc, s, n, epsilon, max_epochs):
     """Estimate the influence of the given starting nodes s"""
     tau = n
 
     while tau >= len(s):
-        if verify_guess(graph_bc, s, n, tau, epsilon, max_epochs) == 1:
+        if verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs) == 1:
             return tau
         tau = tau / (1 + epsilon)
 
@@ -161,6 +159,8 @@ def inf_est(graph_bc, s, n, epsilon, max_epochs):
 def main():
     """Main function to run the training script."""
     setup_logging()
+
+    spark_session = create_spark_session(app_name="Training")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -192,7 +192,7 @@ def main():
     def run_single(airport):
         """Run the influence estimation for a single airport."""
         s = [airport]
-        score = inf_est(graph_broadcast, s, n, EPSILON, max_epochs=MAX_EPOCHS)
+        score = inf_est(spark_session, graph_broadcast, s, n, EPSILON, max_epochs=MAX_EPOCHS)
         return airport, score
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -203,8 +203,8 @@ def main():
             airport = futures[future]
             try:
                 airport_result, score = future.result()
-                logger.info("Airport: %s, Influence Score: %s (%d/%d)", airport_result, score, len(influence_scores), n)
                 influence_scores[airport_result] = score
+                logger.info("Airport: %s, Influence Score: %s (%d/%d)", airport_result, score, len(influence_scores), n)
             except Exception as e:
                 logger.error("Error with %s: %s", airport, e)
 

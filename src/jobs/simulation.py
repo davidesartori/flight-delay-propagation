@@ -18,9 +18,6 @@ from src.simulation.simulation_stats import get_magnitude, get_speed, compute_si
 
 logger = logging.getLogger(__name__)
 
-spark_session = create_spark_session(app_name="Simulation")
-spark_session.sparkContext.setCheckpointDir("checkpoint_dir")
-
 FLIGHT_SEPARATION = 5  # minutes between takeoffs at same airport
 DEFAULT_TURNAROUND = 45  # plane turnaround time
 CHECKPOINT_EVERY = 60
@@ -87,7 +84,7 @@ def process_raw_flights(raw_df, year, month, day):
     )
 
 
-def build_info_and_state(flights_df):
+def build_info_and_state(flights_df, spark_session):
     """Builds flight information and initial state RDD from the processed flights DataFrame."""
     rows = flights_df.orderBy("tail_number", "leg_seq").collect()
 
@@ -126,9 +123,9 @@ def build_info_and_state(flights_df):
     return flight_info_bc, state_rdd
 
 
-def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_influence=False, use_delay_streaming=False,
+def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t_end=1440, use_influence=False, use_delay_streaming=False,
                    delay_streaming_dir="delay_streaming", delay_interval_sec=10, delay_probability=0.001, delay_range=(5, 30),
-                   influxdb_client:InfluxDBService=None, write_events=True):
+                   influxdb_client:InfluxDBService=None, write_events=True, enable_checkpoint=True):
     """Run the flight delay propagation simulation."""
     def resolve_group(item, t):
         _, flights = item
@@ -234,11 +231,11 @@ def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_
                                       (b.get("departure_time") or 0))
         state["scheduled_arrival"] = max((a.get("scheduled_arrival") or 0),
                                       (b.get("scheduled_arrival") or 0))
-        state["is_landed"] = a.get("is_departed") or b.get("is_departed")
+        state["is_landed"] = a.get("is_landed") or b.get("is_landed")
 
         return state
 
-    flight_info_bc, state_rdd = build_info_and_state(flights_df)
+    flight_info_bc, state_rdd = build_info_and_state(flights_df, spark_session)
 
     if use_delay_streaming:
         airports = flights_df.select("origin").distinct().rdd.flatMap(lambda x: x).collect()
@@ -262,9 +259,6 @@ def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_
 
     state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
 
-    not_departed = state_rdd.filter(
-        lambda flight: flight[1]["is_departed"] is False)
-
     series_mag1_rdd = None
     series_mag2_rdd = None
 
@@ -279,8 +273,14 @@ def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_
         time=minutes_to_timestamp(t, date)
     )
 
+    not_departed = state_rdd.filter(
+        lambda flight: flight[1]["is_departed"] is False)
+
+    not_landed = state_rdd.filter(
+        lambda flight: flight[1].get("is_landed", False) is False)
+
     # simulation
-    while not_departed.count() > 0 and t < t_end:
+    while (not_departed.count() > 0 or not_landed.count() > 0) and t < t_end:
         # delays
         if use_delay_streaming:
             pending_delays = consume_pending_delays(delay_buffer, buffer_lock)
@@ -379,7 +379,7 @@ def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_
         state_rdd = state_rdd.union(resolved).union(
             resolved_landing).reduceByKey(merge_states, numPartitions=10)
 
-        if (t - t0) % CHECKPOINT_EVERY == 0:
+        if enable_checkpoint and (t - t0) % CHECKPOINT_EVERY == 0:
             state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
             state_rdd.checkpoint()
             state_rdd.count()
@@ -426,6 +426,10 @@ def run_simulation(flights_df, influence_score_map, date, t0=0, t_end=1440, use_
 
         not_departed = state_rdd.filter(
             lambda flight: flight[1]["is_departed"] is False)
+
+        not_landed = state_rdd.filter(
+            lambda flight: flight[1].get("is_landed", False) is False)
+        
         t += 1
 
     influxdb_client.close()
@@ -473,6 +477,9 @@ def main():
     """Main function to run the flight delay propagation simulation."""
     setup_logging()
 
+    spark_session = create_spark_session(app_name="Simulation")
+    spark_session.sparkContext.setCheckpointDir("checkpoint_dir")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
@@ -512,11 +519,12 @@ def main():
     influxdb_client.delete_table(table="events", hard=True)
     influxdb_client.delete_table(table="control", hard=True)
 
-    final_state, simulation_stats = run_simulation(
-        flights_df, influence_scores, date=datetime(year, month, day), t0=T_START, t_end=T_MAX, use_influence=use_influence,
+    final_state, simulation_stats = run_simulation(spark_session,
+        flights_df, influence_scores, date=datetime(year, month, day), t0=T_START,
+        t_end=T_MAX, use_influence=use_influence,
         use_delay_streaming=use_delay_streaming, delay_streaming_dir=delay_streaming_dir,
         delay_interval_sec=delay_interval_sec, delay_probability=delay_probability,
-        delay_range=delay_range, influxdb_client=influxdb_client, write_events=write_events)
+        delay_range=delay_range, influxdb_client=influxdb_client, write_events=write_events, enable_checkpoint=True)
 
     remaining_flights = final_state.filter(
         lambda x: x[1]["is_departed"] is False)

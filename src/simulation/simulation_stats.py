@@ -49,7 +49,7 @@ def compute_simulation_stats(final_state_rdd, flight_info_bc, influence_scores, 
     n_departed = records.count()
 
     if n_departed == 0:
-        return _empty_stats(not_departed_count)
+        return empty_stats(not_departed_count)
 
     delayed_only = records.filter(lambda r: r[1] >= 1)
     delayed_only.cache()
@@ -68,10 +68,10 @@ def compute_simulation_stats(final_state_rdd, flight_info_bc, influence_scores, 
     avg_delay_delayed = total_delay / n_delayed if n_delayed > 0 else 0
 
     all_delays_sorted = sorted(records.map(lambda r: r[1]).collect())
-    median_delay = _percentile(all_delays_sorted, 50)
+    median_delay = percentile(all_delays_sorted, 50)
 
     percentiles = {
-        f"p{p}": _percentile(all_delays_sorted, p)
+        f"p{p}": percentile(all_delays_sorted, p)
         for p in [50, 75, 90, 95, 99]
     }
     max_delay = all_delays_sorted[-1] if all_delays_sorted else 0
@@ -87,7 +87,7 @@ def compute_simulation_stats(final_state_rdd, flight_info_bc, influence_scores, 
     if n_top > 0:
         top_delays_sorted = sorted(top_records.map(lambda r: r[1]).collect())
         top_avg_delay = sum(top_delays_sorted) / n_top
-        top_median_delay = _percentile(top_delays_sorted, 50)
+        top_median_delay = percentile(top_delays_sorted, 50)
         top_total_delay = sum(d for d in top_delays_sorted if d >= 1)
     else:
         top_avg_delay = top_median_delay = top_total_delay = 0
@@ -127,14 +127,16 @@ def compute_simulation_stats(final_state_rdd, flight_info_bc, influence_scores, 
     }
 
 
-def _percentile(sorted_values, p):
+def percentile(sorted_values, p):
+    """Returns the percentile calculated over the given values"""
     if not sorted_values:
         return 0
     idx = min(len(sorted_values) - 1, int(round((p / 100) * (len(sorted_values) - 1))))
     return sorted_values[idx]
 
 
-def _empty_stats(not_departed_count: int):
+def empty_stats(not_departed_count: int):
+    """Returns stats when no flight is departed"""
     empty_percentiles = {f"p{p}": 0 for p in [50, 75, 90, 95, 99]}
     return {
         "total_delay": 0, "n_delayed_flights": 0, "n_departed_flights": 0,
