@@ -1,9 +1,8 @@
-# .github/workflows/tests.yml
 name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
     branches: [main]
 
