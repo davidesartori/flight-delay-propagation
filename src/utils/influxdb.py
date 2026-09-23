@@ -7,16 +7,15 @@ from influxdb_client_3 import InfluxDBClient3, Point
 
 load_dotenv("./secrets/.env")
 
-INFLUXDB_HOST = os.environ["INFLUXDB_HOST"]
-INFLUXDB_TOKEN = os.environ["INFLUXDB_TOKEN"]
-INFLUXDB_DB = os.environ["INFLUXDB_DB"]
-
 logger = logging.getLogger(__name__)
 
 class InfluxDBService:
     """Service for saving data to influxdb"""
     def __init__(self):
-        self.client = InfluxDBClient3(host=INFLUXDB_HOST, token=INFLUXDB_TOKEN, database=INFLUXDB_DB)
+        self.host = os.environ["INFLUXDB_HOST"]
+        self.token = os.environ["INFLUXDB_TOKEN"]
+        self.db = os.environ["INFLUXDB_DB"]
+        self.client = InfluxDBClient3(host=self.host, token=self.token, database=self.db)
 
 
     def close(self):
@@ -27,13 +26,13 @@ class InfluxDBService:
     def delete_table(self, table: str, hard: bool = False):
         """Deletes a table from InfluxDB, optionally performing a hard delete to
         instantly remove underlying data."""
-        params = {"db": INFLUXDB_DB, "table": table}
+        params = {"db": self.db, "table": table}
         if hard:
             params["hard_delete_at"] = "now"
         resp = requests.delete(
-            f"{INFLUXDB_HOST}/api/v3/configure/table",
+            f"{self.host}/api/v3/configure/table",
             params=params,
-            headers={"Authorization": f"Bearer {INFLUXDB_TOKEN}"},
+            headers={"Authorization": f"Bearer {self.token}"},
             timeout=20
         )
         if resp.status_code == 404:
@@ -101,7 +100,10 @@ def row_to_point(row, measurement: str, tag_cols: list[str], field_cols: list[st
 
 def write_partition(rows, measurement: str, tag_cols: list[str], field_cols: list[str], time_col: str):
     """Writes a partition of rows to InfluxDB."""
-    client = InfluxDBClient3(host=INFLUXDB_HOST, token=INFLUXDB_TOKEN, database=INFLUXDB_DB)
+    host = os.environ["INFLUXDB_HOST"]
+    token = os.environ["INFLUXDB_TOKEN"]
+    db = os.environ["INFLUXDB_DB"]
+    client = InfluxDBClient3(host=host, token=token, database=db)
     points = [row_to_point(r, measurement, tag_cols, field_cols, time_col) for r in rows]
     if points:
         client.write(points)
