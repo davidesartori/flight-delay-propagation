@@ -22,7 +22,7 @@ services:
   influxdb-init:
     image: influxdb:3-core
     container_name: influxdb-init
-    entrypoint: ["/bin/bash", "/init/init.sh"]
+    entrypoint: ["/bin/bash", "/init/influxdb_init.sh"]
     depends_on:
       influxdb:
         condition: service_healthy
@@ -30,7 +30,7 @@ services:
       - INFLUXDB_HOST=http://influxdb:8181
       - INFLUX_DB_NAME=flight-delay-propagation
     volumes:
-      - ./init/init.sh:/init/init.sh:ro
+      - ./init/influxdb_init.sh:/init/influxdb_init.sh:ro
       - internal-state:/internal
       - ./secrets:/hostenv
 
@@ -51,6 +51,19 @@ services:
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
       - ./grafana/dashboards:/var/lib/grafana/dashboards
     restart: unless-stopped
+
+  data-init:
+    image: alpine:latest
+    container_name: data-init
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl unzip
+        /bin/sh /init/data_init.sh
+    volumes:
+      - ./init/data_init.sh:/init/data_init.sh:ro
+      - ./dataset:/dataset
 
 volumes:
   influxdb-data:
