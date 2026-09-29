@@ -1,3 +1,4 @@
+airportsdata==20260905
 certifi==2026.7.22
 charset-normalizer==3.5.1
 idna==3.20

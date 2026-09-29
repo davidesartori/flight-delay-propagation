@@ -2,7 +2,14 @@
 from unittest.mock import MagicMock
 from datetime import datetime
 from pyspark.sql import functions as F
-from src.jobs.simulation import parse_hhmm_to_minutes, convert_minutes_to_hhmm, minutes_to_timestamp, process_raw_flights, build_info_and_state, run_simulation, DEFAULT_TURNAROUND
+from src.jobs.simulation import (parse_hhmm_to_minutes,
+                                 convert_minutes_to_hhmm,
+                                 minutes_to_timestamp,
+                                 process_raw_flights,
+                                 build_info_and_state,
+                                 run_simulation,
+                                 DEFAULT_TURNAROUND,
+                                 convert_to_central)
 
 
 def test_parse_hhmm_to_minutes_multiple_rows(spark):
@@ -58,7 +65,7 @@ def test_process_raw_flights_combined(spark):
 
     rows = [
         _base_row(TAIL_NUMBER="N12345", SCHEDULED_DEPARTURE=600, DEPARTURE_DELAY=10),
-        _base_row(TAIL_NUMBER="N12345", SCHEDULED_DEPARTURE=1200, DEPARTURE_DELAY=5),
+        _base_row(TAIL_NUMBER="N12345", SCHEDULED_DEPARTURE=1200, DEPARTURE_DELAY=5, ORIGIN_AIRPORT="ORD"),
         _base_row(TAIL_NUMBER="N00000", DAY=3),
         _base_row(TAIL_NUMBER="N11111", CANCELLED=1),
         _base_row(TAIL_NUMBER=None),
@@ -66,7 +73,7 @@ def test_process_raw_flights_combined(spark):
         _base_row(TAIL_NUMBER="N22222", DEPARTURE_DELAY=None),
     ]
     df = spark.createDataFrame(rows)
-    result = process_raw_flights(df, year=2015, month=8, day=2).collect()
+    result = process_raw_flights(spark, df, year=2015, month=8, day=2).collect()
 
     result_by_tail = {}
     for row in result:
@@ -75,7 +82,7 @@ def test_process_raw_flights_combined(spark):
     assert set(result_by_tail.keys()) == {"N12345", "N22222"}
 
     n12345_legs = sorted(result_by_tail["N12345"], key=lambda r: r["scheduled_departure"])
-    assert n12345_legs[0]["scheduled_departure"] == 360
+    assert n12345_legs[0]["scheduled_departure"] == 300
     assert n12345_legs[0]["leg_seq"] == 0
     assert n12345_legs[0]["flight_id"] == "N12345_0"
     assert n12345_legs[1]["scheduled_departure"] == 720
@@ -305,3 +312,77 @@ def test_run_simulation_multi_leg_itinerary(spark):
 
     expected_departure = final_state["N12345_0"]["scheduled_arrival"] + DEFAULT_TURNAROUND
     assert final_state["N12345_1"]["departure_time"] == expected_departure + final_state["N12345_1"]["delay"]
+
+
+class TestConvertToCentral:
+    """Tests for Central Time conversion."""
+
+    def test_new_york_to_central(self):
+        """Test conversion from Eastern to Central Time."""
+        airport_tz = {"JFK": "America/New_York"}
+
+        result = convert_to_central(
+            1430, "JFK", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 1330
+
+    def test_los_angeles_to_central(self):
+        """Test conversion from Pacific to Central Time."""
+        airport_tz = {"LAX": "America/Los_Angeles"}
+
+        result = convert_to_central(
+            1430, "LAX", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 1630
+
+    def test_already_central(self):
+        """Test an airport already in Central Time."""
+        airport_tz = {"ORD": "America/Chicago"}
+
+        result = convert_to_central(
+            1430, "ORD", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 1430
+
+    def test_none_time(self):
+        """Test a missing departure time."""
+        airport_tz = {"JFK": "America/New_York"}
+
+        result = convert_to_central(
+            None, "JFK", airport_tz, 2015, 7, 1
+        )
+
+        assert result is None
+
+    def test_unknown_airport(self):
+        """Test an unknown airport."""
+        airport_tz = {"JFK": "America/New_York"}
+
+        result = convert_to_central(
+            1430, "UNKNOWN", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 1430
+
+    def test_midnight_padding(self):
+        """Test HHMM values with missing leading zero."""
+        airport_tz = {"JFK": "America/New_York"}
+
+        result = convert_to_central(
+            30, "JFK", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 2330
+
+    def test_daylight_saving_time(self):
+        """Test daylight saving time conversion."""
+        airport_tz = {"JFK": "America/New_York"}
+
+        result = convert_to_central(
+            1200, "JFK", airport_tz, 2015, 7, 1
+        )
+
+        assert result == 1100

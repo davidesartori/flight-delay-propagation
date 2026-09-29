@@ -4,7 +4,9 @@ import threading
 import logging
 import argparse
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import yaml
+import airportsdata
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark import StorageLevel
@@ -46,10 +48,35 @@ def minutes_to_timestamp(minutes: int, base_date: datetime, seconds=0) -> dateti
     return base_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=minutes, seconds=seconds)
 
 
-def process_raw_flights(raw_df, year, month, day):
+def convert_to_central(hhmm, airport, airport_tz, year, month, day):
+    """Convert an airport local HHMM time to Central Time.""" 
+    if hhmm is None or airport not in airport_tz:
+        return hhmm
+    hhmm = str(int(hhmm)).zfill(4)
+    hour = int(hhmm[:2])
+    minute = int(hhmm[2:])
+    local_dt = datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(airport_tz[airport]))
+    central_dt = local_dt.astimezone(ZoneInfo("America/Chicago"))
+
+    return central_dt.hour * 100 + central_dt.minute
+
+
+def convert_to_central_udf(airport_tz_bc, year, month, day):
+    """Create a Spark UDF for Central Time conversion."""
+    return F.udf(lambda hhmm, airport:
+                 convert_to_central(hhmm, airport, airport_tz_bc.value, year, month, day), "int")
+
+
+def process_raw_flights(spark_session, raw_df, year, month, day):
     """Process raw flight data for a specific date, filtering out 
     cancelled flights and those without tail numbers. It also assigns a
     sequence number to each leg of the flight based on the tail number"""
+
+    airports = airportsdata.load("IATA")
+    airport_tz = { code: info["tz"] for code, info in airports.items() if info.get("tz") }
+    airport_tz["ISN"] = "America/Chicago"
+    airport_tz_bc = spark_session.sparkContext.broadcast(airport_tz)
+
     day_df = raw_df.filter(
         (F.col("YEAR") == year) & (F.col("MONTH") == month) & (F.col("DAY") == day) &
         (F.col("CANCELLED") == 0)
@@ -59,7 +86,7 @@ def process_raw_flights(raw_df, year, month, day):
 
     day_df = day_df.withColumn(
         "scheduled_departure", parse_hhmm_to_minutes(
-            F.col("SCHEDULED_DEPARTURE"))
+            convert_to_central_udf(airport_tz_bc, year, month, day)( F.col("SCHEDULED_DEPARTURE"), F.col("ORIGIN_AIRPORT")))
     ).withColumn(
         "scheduled_flying_time", F.col("SCHEDULED_TIME").cast("int")
     ).withColumn(
@@ -494,7 +521,7 @@ def main():
     raw_flights_df = spark_session.read.csv(
         config["input"]["flights"], header=True, inferSchema=True)
 
-    flights_df = process_raw_flights(raw_flights_df, year=2015, month=8, day=2)
+    flights_df = process_raw_flights(spark_session, raw_flights_df, year=2015, month=8, day=2)
     flights_df = flights_df.persist()
 
     logger.info("Starting simulation")
@@ -520,7 +547,7 @@ def main():
     influxdb_client.delete_table(table="control", hard=True)
 
     final_state, simulation_stats = run_simulation(spark_session,
-        flights_df, influence_scores, date=datetime(year, month, day), t0=T_START,
+        flights_df, influence_scores, date=datetime(year, month, day, tzinfo=ZoneInfo("America/Chicago")), t0=T_START,
         t_end=T_MAX, use_influence=use_influence,
         use_delay_streaming=use_delay_streaming, delay_streaming_dir=delay_streaming_dir,
         delay_interval_sec=delay_interval_sec, delay_probability=delay_probability,
