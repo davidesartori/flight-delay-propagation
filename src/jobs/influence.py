@@ -1,54 +1,19 @@
 """Training script for calculating influence scores of airports."""
 import logging
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict
 import random
 import math
-from pyspark.sql import functions as F
+import pickle
+from pyspark import StorageLevel
 import yaml
-from src.utils.spark import create_spark_session
+from src.utils.spark import create_spark_session, compute_num_slices
+from src.influence.common import create_graph, estimate_rdd_size_for_epoch, compute_avg_out_degree, merge_labels
 from src.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
 EPSILON = 0.1
 MAX_EPOCHS = 3
-DELAY_THRESHOLD = 15
-
-
-def create_graph(data):
-    """Create a directed graph from the flight data with delay probabilities."""
-    route_delay_probability = (
-        data
-        .withColumn("is_delayed", F.when(F.col("DEPARTURE_DELAY") >
-                                         DELAY_THRESHOLD, 1).otherwise(0))
-        .groupBy("ORIGIN_AIRPORT", "DESTINATION_AIRPORT")
-        .agg(
-            F.count("*").alias("n_flights"),
-            F.sum("is_delayed").alias("n_delayed")
-        )
-        .withColumn("delay_ratio", F.col("n_delayed") / F.col("n_flights"))
-    )
-
-    edges = route_delay_probability.select(
-        "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "delay_ratio"
-    ).collect()
-
-    graph = defaultdict(list)
-
-    for row in edges:
-        origin = row["ORIGIN_AIRPORT"]
-        dest = row["DESTINATION_AIRPORT"]
-        prob = row["delay_ratio"]
-        graph[origin].append((dest, prob))
-
-    graph = {
-        origin: sorted(neighbors, key=lambda x: x[1], reverse=True)
-        for origin, neighbors in graph.items()
-    }
-
-    return graph
 
 
 def infect(current_node, graph_bc, t):
@@ -67,73 +32,76 @@ def infect(current_node, graph_bc, t):
     return results
 
 
-def merge_labels(label1, label2):
-    """Merge labels for the same node"""
-    if label1 == "old" or label2 == "old":
-        return "old"
-    return "new"
-
-
-def sample_oracle(spark_session, graph_bc, s, l, t, max_epochs):
+def sample_oracle(spark_session, graph_bc, s, l, t, max_epochs, avg_out_degree, n_total_nodes, node_size):
     """Run the sampling oracle to estimate influence"""
-    infected_nodes_list = [
-        ((sample_id, node), "new")
-        for sample_id in range(l)
-        for node in s
-    ]
+    initial_num_slices = compute_num_slices(spark_session, l, node_size)
+    infected_nodes_rdd = (spark_session.sparkContext.range(l, numSlices=initial_num_slices)
+                        .flatMap(lambda sample_id: [((sample_id, node), "new") for node in s ]))
 
-    infected_nodes_rdd = spark_session.sparkContext.parallelize(
-        infected_nodes_list)
+    incomplete_samples = (spark_session.sparkContext.range(l)
+                        .map(lambda sample_id: (sample_id, None)))
 
-    incomplete_samples = set(range(l))
-    r_t = {}
-    epoch = 1
+    n_incomplete = l
+    n_over_threshold = 0
+    epoch = 0
 
-    while (len(incomplete_samples) > 0 and epoch < max_epochs):
-        active_samples_infected_nodes_rdd = infected_nodes_rdd.filter(
-            lambda node: node[0][0] in incomplete_samples)
+    while n_incomplete > 0 and epoch < max_epochs:
+        active_samples_infected_nodes_rdd = (infected_nodes_rdd.map(lambda row: (row[0][0], row))
+                                             .join(incomplete_samples)
+                                             .map(lambda row: row[1][0]))
         new_nodes = active_samples_infected_nodes_rdd.filter(
             lambda node: node[1] == 'new')
 
-        t_d = new_nodes.flatMap(lambda row: infect(row, graph_bc, 1000))
+        t_d = new_nodes.flatMap(lambda row: infect(row, graph_bc, t))
+
+        estimated_size = estimate_rdd_size_for_epoch(
+            n_incomplete, avg_out_degree, n_total_nodes, epoch + 1
+        )
+        epoch_num_slices = compute_num_slices(spark_session, estimated_size, node_size)
 
         old_nodes = active_samples_infected_nodes_rdd.filter(
             lambda node: node[1] == "old")
-        r_d = t_d.union(old_nodes)
-        r_d = r_d.reduceByKey(merge_labels)
 
+        r_d = (t_d.union(old_nodes)
+               .reduceByKey(merge_labels, numPartitions=epoch_num_slices)
+               .persist(StorageLevel.DISK_ONLY))
+
+
+        sample_stats = (r_d.map(lambda row: (row[0][0], (1, row[1] == "old")))
+                        .reduceByKey(lambda a, b: (a[0] + b[0], a[1] and b[1]), numPartitions=epoch_num_slices))
+
+        completed_samples = (sample_stats.filter( lambda row: row[1][0] >= t or row[1][1])
+                             .persist(StorageLevel.MEMORY_AND_DISK))
+
+        completed_count, successful_count = (completed_samples.map(lambda row: ( 1, int(row[1][0] >= t)))
+                                             .fold((0, 0), lambda a, b: (a[0] + b[0], a[1] + b[1])))
+
+        n_incomplete -= completed_count
+        n_over_threshold += successful_count
+
+        next_incomplete_samples = (incomplete_samples.subtractByKey(completed_samples.map(lambda row: (row[0], None)))
+                                   .persist(StorageLevel.MEMORY_AND_DISK))
+
+        completed_samples.unpersist()
+        incomplete_samples = next_incomplete_samples
         infected_nodes_rdd = r_d
-
-        completion_check = (
-            r_d
-            .map(lambda row: (
-                row[0][0],
-                (1, row[1] == "old")))
-            .reduceByKey(lambda a, b: (
-                a[0] + b[0],
-                a[1] and b[1]))
-            .collect()
-        )
-
-        for sample_id, (size, all_old) in completion_check:
-            if size >= t or all_old:
-                incomplete_samples.discard(sample_id)
-                r_t[sample_id] = size
 
         epoch += 1
 
-    n_over_threshold = sum(1 for size in r_t.values() if size >= t)
+    incomplete_samples.unpersist()
+
     return n_over_threshold / l
 
 
-def verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs):
+def verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs, avg_out_degree, node_size):
     """Verify the guess of influence"""
     t = tau
     total = 0.0
 
     while t <= n:
-        l = max(10, math.ceil(8 * t * (math.log(n) ** 3) / (tau ** 2)))
-        pi_t_l = sample_oracle(spark_session, graph_bc, s, l, int(round(t)), max_epochs)
+        l = max(10, math.ceil(8 * t * (math.log(n) ** 3) / (epsilon ** 2 * tau)))
+        l = 2
+        pi_t_l = sample_oracle(spark_session, graph_bc, s, l, int(round(t)), max_epochs, avg_out_degree, 1, node_size)
         total += (epsilon / (1 + epsilon)) * t * pi_t_l
 
         if total >= (1 - 2 * epsilon) * tau:
@@ -144,12 +112,12 @@ def verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs):
     return 0
 
 
-def inf_est(spark_session, graph_bc, s, n, epsilon, max_epochs):
+def inf_est(spark_session, graph_bc, s, n, epsilon, max_epochs, avg_out_degree, node_size):
     """Estimate the influence of the given starting nodes s"""
     tau = n
 
     while tau >= len(s):
-        if verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs) == 1:
+        if verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs, avg_out_degree, node_size) == 1:
             return tau
         tau = tau / (1 + epsilon)
 
@@ -169,8 +137,6 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    max_workers = config["training"]["workers"]
-
     file = config["input"]["flights"]
     data = spark_session.read.format("csv")\
         .option("header", "true")\
@@ -180,33 +146,30 @@ def main():
     graph = create_graph(data)
 
     graph_broadcast = spark_session.sparkContext.broadcast(graph)
-
-    spark_session.sparkContext.setLocalProperty("spark.scheduler.mode", "FAIR")
+    avg_out_degree = compute_avg_out_degree(graph)
     n = len(graph_broadcast.value)
 
     airports = list(graph_broadcast.value.keys())
+
+    logger.info("Starting influence estimation for %d airports", len(airports))
+
+    node_size = len(pickle.dumps(((0, "ORD"), "new")))
+
     influence_scores = {}
-
-    logger.info("Starting influence estimation for %d airports with %d workers", len(airports), max_workers)
-
-    def run_single(airport):
-        """Run the influence estimation for a single airport."""
-        s = [airport]
-        score = inf_est(spark_session, graph_broadcast, s, n, EPSILON, max_epochs=MAX_EPOCHS)
-        return airport, score
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(run_single, airport)
-                                   : airport for airport in airports}
-
-        for future in as_completed(futures):
-            airport = futures[future]
-            try:
-                airport_result, score = future.result()
-                influence_scores[airport_result] = score
-                logger.info("Airport: %s, Influence Score: %s (%d/%d)", airport_result, score, len(influence_scores), n)
-            except Exception as e:
-                logger.error("Error with %s: %s", airport, e)
+    for airport in airports:
+        try:
+            s = [airport]
+            score = inf_est(
+                spark_session, graph_broadcast, s, n, EPSILON,
+                max_epochs=MAX_EPOCHS, avg_out_degree=avg_out_degree, node_size=node_size
+            )
+            influence_scores[airport] = score
+            logger.info(
+                "Airport: %s, Influence Score: %s (%d/%d)",
+                airport, score, len(influence_scores), n
+            )
+        except Exception:
+            logger.exception("Error with %s", airport)
 
     output_file = config["output"]["training"]
     with open(output_file, "w", encoding="utf-8") as f:

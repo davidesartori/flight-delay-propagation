@@ -6,9 +6,6 @@ output:
   simulation: "output/sim_result.txt"
   training: "output/influence_scores.csv"
 
-training:
-  workers: 10
-
 simulation:
   day: 2
   month: 8

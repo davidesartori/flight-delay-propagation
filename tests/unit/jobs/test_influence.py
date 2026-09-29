@@ -1,9 +1,7 @@
 """Testing module for influence job"""
-import csv
 import random
-import textwrap
 import pytest
-import src.jobs.influence as influence
+from src.jobs import influence
 
 
 @pytest.fixture
@@ -87,20 +85,6 @@ def test_delay_threshold_boundary_not_counted(spark):
     assert dict(graph["A"])["B"] == pytest.approx(0.0)
 
 
-class TestMergeLabels:
-    """Tests for the merge_labels function."""
-
-    @pytest.mark.parametrize("l1,l2,expected", [
-        ("old", "old", "old"),
-        ("old", "new", "old"),
-        ("new", "old", "old"),
-        ("new", "new", "new"),
-    ])
-    def test_merge_labels_truth_table(self, l1, l2, expected):
-        """merge_labels should return 'old' if either label is 'old', else 'new'."""
-        assert influence.merge_labels(l1, l2) == expected
-
-
 class TestInfect:
     """Tests for the infect function."""
 
@@ -159,7 +143,7 @@ class TestSampleOracle:
     ):
         """sample_oracle should return a fraction between 0 and 1."""
         bc = broadcast_factory(toy_graph)
-        result = influence.sample_oracle(spark, bc, s=["A"], l=5, t=2, max_epochs=3)
+        result = influence.sample_oracle(spark, bc, s=["A"], l=5, t=2, max_epochs=3, avg_out_degree=10, n_total_nodes=3, node_size=100)
         assert 0.0 <= result <= 1.0
 
     def test_isolated_node_never_exceeds_threshold_gt_1(
@@ -167,7 +151,7 @@ class TestSampleOracle:
     ):
         """An isolated seed node should never reach a threshold greater than 1."""
         bc = broadcast_factory({"Z": []})
-        result = influence.sample_oracle(spark, bc, s=["Z"], l=3, t=2, max_epochs=3)
+        result = influence.sample_oracle(spark, bc, s=["Z"], l=3, t=2, max_epochs=3, avg_out_degree=0, n_total_nodes=1, node_size=100)
         assert result == pytest.approx(0.0)
 
 
@@ -180,7 +164,7 @@ class TestVerifyGuessAndInfEst:
         """verify_guess should always return either 0 or 1."""
         bc = broadcast_factory(toy_graph)
         result = influence.verify_guess(
-            spark, bc, s=["A"], n=3, tau=1, epsilon=influence.EPSILON, max_epochs=3
+            spark, bc, s=["A"], n=3, tau=1, epsilon=influence.EPSILON, max_epochs=3, avg_out_degree=10, node_size=100
         )
         assert result in (0, 1)
 
@@ -189,5 +173,5 @@ class TestVerifyGuessAndInfEst:
     ):
         """inf_est should never return a score smaller than the seed set size."""
         bc = broadcast_factory(toy_graph)
-        score = influence.inf_est(spark, bc, s=["A"], n=3, epsilon=influence.EPSILON, max_epochs=3)
+        score = influence.inf_est(spark, bc, s=["A"], n=3, epsilon=influence.EPSILON, max_epochs=3, avg_out_degree=10, node_size=100)
         assert score >= 1

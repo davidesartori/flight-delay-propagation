@@ -377,7 +377,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             influxdb_client.write_points(resolutions)
 
         state_rdd = state_rdd.union(resolved).union(
-            resolved_landing).reduceByKey(merge_states, numPartitions=10)
+            resolved_landing).reduceByKey(merge_states, numPartitions=spark_session.sparkContext.defaultParallelism)
 
         if enable_checkpoint and (t - t0) % CHECKPOINT_EVERY == 0:
             state_rdd = state_rdd.persist(StorageLevel.MEMORY_AND_DISK)
