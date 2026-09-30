@@ -1,4 +1,5 @@
 """Training script for calculating influence scores of airports."""
+import os
 import logging
 import argparse
 import random
@@ -171,6 +172,7 @@ def main():
             logger.exception("Error with %s", airport)
 
     output_file = config["output"]["training"]
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("airport,score\n")
         for airport, score in influence_scores.items():

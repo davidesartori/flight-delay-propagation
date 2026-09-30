@@ -20,5 +20,6 @@ def load__influence_scores(path: str) -> dict:
 
 def save_output(path: str, text: str):
     """Write output to file"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="\n", encoding="utf-8") as f:
         f.write(text)

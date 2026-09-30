@@ -79,7 +79,7 @@ services:
     command: >
       spark-submit
       src/jobs/influence.py
-      --config config/training.yaml
+      --config config/config.yaml
 
   training-fixed-samples:
     profiles: ["jobs"]

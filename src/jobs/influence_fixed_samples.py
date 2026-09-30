@@ -1,6 +1,7 @@
 """Optimized training script for calculating influence scores of airports.
 This version processes all airports together at each level of the InfEst algorithm.
 """
+import os
 import logging
 import argparse
 import random
@@ -53,7 +54,7 @@ def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_ep
 
     while n_incomplete > 0 and epoch < max_epochs:
         estimated_size = estimate_rdd_size_for_epoch(
-            n_incomplete, avg_out_degree, n_total_nodes, epoch
+            n_incomplete, avg_out_degree, n_total_nodes, epoch + 1
         )
         epoch_num_partitions = compute_num_slices(spark_session, estimated_size, node_size)
 
@@ -211,6 +212,7 @@ def main():
     logger.info("Finished influence estimation for %d airports", len(influence_scores))
 
     output_file = config["output"]["training"]
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         f.write("airport,score\n")
         for airport, score in influence_scores.items():
