@@ -20,12 +20,11 @@ from src.simulation.simulation_stats import get_magnitude, get_speed, compute_si
 
 logger = logging.getLogger(__name__)
 
-FLIGHT_SEPARATION = 5  # minutes between takeoffs at same airport
+FLIGHT_SEPARATION = 3  # minutes between takeoffs at same airport
 DEFAULT_TURNAROUND = 45  # plane turnaround time
 CHECKPOINT_EVERY = 60
 T_START = 0
 T_MAX = 2880  # 2 days in minutes
-INFLUENCE_RATE = 3  # influence factor for delay propagation
 
 
 def parse_hhmm_to_minutes(col):
@@ -150,9 +149,9 @@ def build_info_and_state(flights_df, spark_session):
     return flight_info_bc, state_rdd
 
 
-def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t_end=1440, use_influence=False, use_delay_streaming=False,
-                   delay_streaming_dir="delay_streaming", delay_interval_sec=10, delay_probability=0.001, delay_range=(5, 30),
-                   influxdb_client:InfluxDBService=None, write_events=True, enable_checkpoint=True):
+def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t_end=1440, use_influence=False, influence_rate=1,
+                   use_delay_streaming=False, delay_streaming_dir="delay_streaming", delay_interval_sec=10, delay_probability=0.001,
+                   delay_range=(5, 30), influxdb_client:InfluxDBService=None, write_events=True, enable_checkpoint=True):
     """Run the flight delay propagation simulation."""
     def resolve_group(item, t):
         _, flights = item
@@ -166,7 +165,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             delay = state["delay"]
             priority = delay if delay > 0 else 1
             if influence > 0 and delay > 0:
-                priority *= (1 + INFLUENCE_RATE * ((influence - 1) / 99)**2)
+                priority *= (1 + influence_rate * ((influence - 1) / 99)**2)
             return priority
 
         winner_id, _ = max(flights, key=priority_key)
@@ -216,7 +215,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
                                                    0) if influence_bc else 0
                 priority = delay if delay > 0 else 1
                 if influence > 0 and delay > 0:
-                    priority *= (1 + INFLUENCE_RATE *
+                    priority *= (1 + influence_rate *
                                  ((influence - 1) / 99)**2)
 
             return priority
@@ -371,7 +370,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             influxdb_client.write_points(resolutions)
 
             if not winner_flights.isEmpty():
-                departed_flights_messages_rdd = winner_flights.map(lambda flight: (f"{flight_info_bc.value[flight[0]]['origin']} -> {flight_info_bc.value[flight[0]]['destination']} | Departed at {convert_minutes_to_hhmm(t)} with delay of {flight[1]["delay"]} minutes", minutes_to_timestamp(t, date)))
+                departed_flights_messages_rdd = winner_flights.map(lambda flight: (f"{flight_info_bc.value[flight[0]]['origin']} -> {flight_info_bc.value[flight[0]]['destination']} | Departed at {convert_minutes_to_hhmm(t)} with delay of {flight[1]['delay']} minutes", minutes_to_timestamp(t, date)))
                 departed_flights_messages_df = spark_session.createDataFrame(departed_flights_messages_rdd, schema=["message", "timestamp"])
 
                 influxdb_client.write_dataframe(departed_flights_messages_df, measurement="events", tag_cols=[], field_cols=["message"], time_col="timestamp")
@@ -529,6 +528,7 @@ def main():
     day = config["simulation"].get("day")
     month = config["simulation"].get("month")
     year = config["simulation"].get("year")
+    influence_rate = config["simulation"].get("influence_rate", 1)
     use_influence = config["simulation"].get("influence", True)
     use_delay_streaming = config["simulation"].get("delay_streaming", False)
     delay_streaming_dir = config["delay_streaming"].get("input_dir", "delay_streaming")
@@ -548,7 +548,7 @@ def main():
 
     final_state, simulation_stats = run_simulation(spark_session,
         flights_df, influence_scores, date=datetime(year, month, day, tzinfo=ZoneInfo("America/Chicago")), t0=T_START,
-        t_end=T_MAX, use_influence=use_influence,
+        t_end=T_MAX, use_influence=use_influence, influence_rate=influence_rate,
         use_delay_streaming=use_delay_streaming, delay_streaming_dir=delay_streaming_dir,
         delay_interval_sec=delay_interval_sec, delay_probability=delay_probability,
         delay_range=delay_range, influxdb_client=influxdb_client, write_events=write_events, enable_checkpoint=True)

@@ -10,6 +10,7 @@ simulation:
   day: 2
   month: 8
   year: 2015
+  influence_rate: 1
   influence: true
   delay_streaming: true
   write_events: true

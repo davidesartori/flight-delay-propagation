@@ -100,8 +100,7 @@ def verify_guess(spark_session, graph_bc, s, n, tau, epsilon, max_epochs, avg_ou
 
     while t <= n:
         l = max(10, math.ceil(8 * t * (math.log(n) ** 3) / (epsilon ** 2 * tau)))
-        l = 2
-        pi_t_l = sample_oracle(spark_session, graph_bc, s, l, int(round(t)), max_epochs, avg_out_degree, 1, node_size)
+        pi_t_l = sample_oracle(spark_session, graph_bc, s, l, int(round(t)), max_epochs, avg_out_degree, n, node_size)
         total += (epsilon / (1 + epsilon)) * t * pi_t_l
 
         if total >= (1 - 2 * epsilon) * tau:

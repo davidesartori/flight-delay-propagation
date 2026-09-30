@@ -65,6 +65,54 @@ services:
       - ./init/data_init.sh:/init/data_init.sh:ro
       - ./dataset:/dataset
 
+  training:
+    profiles: ["jobs"]
+    build: .
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+      data-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      spark-submit
+      src/jobs/influence.py
+      --config config/training.yaml
+
+  training-fixed-samples:
+    profiles: ["jobs"]
+    build: .
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+      data-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      spark-submit
+      src/jobs/influence_fixed_samples.py
+      --config config/config.yaml
+
+  simulation:
+    profiles: ["jobs"]
+    build: .
+    depends_on:
+      influxdb-init:
+        condition: service_completed_successfully
+      data-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      spark-submit
+      src/jobs/simulation.py
+      --config config/config.yaml
+
 volumes:
   influxdb-data:
   grafana-data:
