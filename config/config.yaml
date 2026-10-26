@@ -6,6 +6,10 @@ output:
   simulation: "output/sim_result.txt"
   training: "output/influence_scores.csv"
 
+influence:
+  fixed_samples: true
+  n_samples: 20
+
 simulation:
   day: 2
   month: 8

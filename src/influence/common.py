@@ -3,21 +3,7 @@
 from pyspark.sql import functions as F
 
 DELAY_THRESHOLD = 15
-
-
-def estimate_rdd_size_for_epoch(n_active_samples, avg_out_degree, n_total_nodes, epoch):
-    """Upper-bound estimate of the number of elements in the infected RDD
-    at a given epoch of sample_oracle_batched."""
-    estimated_per_sample = min(avg_out_degree ** epoch, n_total_nodes)
-    return n_active_samples * estimated_per_sample
-
-
-def compute_avg_out_degree(graph):
-    """upper-bound estimate of the branching factor,
-    used to size Spark partitions during the infection loop."""
-    if not graph:
-        return 0.0
-    return sum(len(neighbors) for neighbors in graph.values()) / len(graph)
+NEW, OLD = 1, 0
 
 
 def create_graph(data):
@@ -54,7 +40,7 @@ def create_graph(data):
 
 
 def merge_labels(label1, label2):
-    """Merge labels for the same node"""
-    if label1 == "old" or label2 == "old":
-        return "old"
-    return "new"
+    """Merge labels for the same node: OLD prevails."""
+    if label1 == OLD or label2 == OLD:
+        return OLD
+    return NEW

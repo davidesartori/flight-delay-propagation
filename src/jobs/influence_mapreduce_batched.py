@@ -1,23 +1,22 @@
 """Optimized training script for calculating influence scores of airports.
-This version processes all airports together at each level of the InfEst algorithm.
-"""
+This version processes all airports together at each level of the InfEst algorithm."""
 import os
 import logging
 import argparse
 import random
-import pickle
+import math
 import yaml
 from pyspark import StorageLevel
-from src.utils.spark import create_spark_session, compute_num_slices
+from src.utils.spark import create_spark_session
 from src.utils.logging import setup_logging
-from src.influence.common import create_graph, estimate_rdd_size_for_epoch, compute_avg_out_degree, merge_labels
+from src.influence.common import (create_graph,
+                                  merge_labels,
+                                  NEW, OLD)
 
 logger = logging.getLogger(__name__)
 
 EPSILON = 0.1
 MAX_EPOCHS = 3
-DELAY_THRESHOLD = 15
-N_SAMPLES = 20
 
 
 def infect_batched(row, graph_bc, t):
@@ -29,21 +28,19 @@ def infect_batched(row, graph_bc, t):
     results = []
     for v, infection_probability in out_neighbors:
         if random.random() < infection_probability:
-            results.append(((airport, sample_id, v), "new"))
+            results.append(((airport, sample_id, v), NEW))
 
-    results.append(((airport, sample_id, u), "old"))
+    results.append(((airport, sample_id, u), OLD))
     return results
 
 
-def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_epochs,
-                          avg_out_degree, n_total_nodes, node_size):
-    """Runs the sampling oracle for all airports in `active_airports` at once"""
+def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_epochs):
+    """Runs the sampling oracle for all airports in active_airports at once"""
     sc = spark_session.sparkContext
-    initial_num_slices = compute_num_slices(spark_session, len(active_airports) * l, node_size)
 
     infected_nodes_rdd = (
-        sc.parallelize(active_airports, numSlices=initial_num_slices)
-        .flatMap(lambda airport: [((airport, sample_id, airport), "new") for sample_id in range(l)])
+        sc.parallelize(active_airports)
+        .flatMap(lambda airport: [((airport, sample_id, airport), NEW) for sample_id in range(l)])
     )
 
     n_incomplete = len(active_airports) * l
@@ -53,21 +50,16 @@ def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_ep
     prev_persisted = []
 
     while n_incomplete > 0 and epoch < max_epochs:
-        estimated_size = estimate_rdd_size_for_epoch(
-            n_incomplete, avg_out_degree, n_total_nodes, epoch + 1
-        )
-        epoch_num_partitions = compute_num_slices(spark_session, estimated_size, node_size)
-
         r_d = (
             infected_nodes_rdd
-            .flatMap(lambda row: infect_batched(row, graph_bc, t) if row[1] == "new" else [row])
-            .reduceByKey(merge_labels, numPartitions=epoch_num_partitions)
+            .flatMap(lambda node: infect_batched(node, graph_bc, t) if node[1] == NEW else [node])
+            .reduceByKey(merge_labels)
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
 
         status = (
-            r_d # ((sample_id, node), "new")
-            .map(lambda row: ((row[0][0], row[0][1]), (1, row[1] == "old"))) # (sample_id, node) -> (1, is_old)
+            r_d # ((sample_id, node), 1)
+            .map(lambda node: ((node[0][0], node[0][1]), (1, node[1] == OLD))) # (sample_id, node) -> (1, is_old)
             .reduceByKey(lambda a, b: (a[0] + b[0], a[1] and b[1]))
             .mapValues(lambda v: (v[0], v[0] >= t or v[1]))
             .persist(StorageLevel.MEMORY_AND_DISK)
@@ -93,8 +85,8 @@ def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_ep
 
         infected_nodes_rdd = (
             r_d
-            .map(lambda row: ((row[0][0], row[0][1]), row))
-            .subtractByKey(completed_keys, numPartitions=epoch_num_partitions)
+            .map(lambda node: ((node[0][0], node[0][1]), node))
+            .subtractByKey(completed_keys)
             .map(lambda kv: kv[1])
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
@@ -111,19 +103,18 @@ def sample_oracle_batched(spark_session, graph_bc, active_airports, l, t, max_ep
     return {airport: counts_over_threshold[airport] / l for airport in active_airports}
 
 
-def verify_guess_batched(spark_session, graph_bc, active_airports, n, tau, epsilon, max_epochs, avg_out_degree, node_size):
-    """Runs VerifyGuess for all airports in `active_airports` at once."""
+def verify_guess_batched(spark_session, graph_bc, active_airports, n, tau, epsilon, max_epochs, n_samples=None):
+    """Runs VerifyGuess for all airports in active_airports at once."""
     totals = {airport: 0.0 for airport in active_airports}
     still_undecided = set(active_airports)
     accepted = set()
 
     t = tau
     while t <= n and still_undecided:
-        l = N_SAMPLES
+        l = max(10, int(round(8 * t * (math.log(n) ** 3) / (epsilon ** 2 * tau)))) if n_samples is None else n_samples
 
         pi_t_l_by_airport = sample_oracle_batched(
-            spark_session, graph_bc, list(still_undecided), l, int(round(t)), max_epochs, avg_out_degree, n, node_size
-        )
+            spark_session, graph_bc, list(still_undecided), l, int(round(t)), max_epochs)
 
         for airport in list(still_undecided):
             totals[airport] += (epsilon / (1 + epsilon)) * t * pi_t_l_by_airport[airport]
@@ -137,16 +128,16 @@ def verify_guess_batched(spark_session, graph_bc, active_airports, n, tau, epsil
     return {airport: (1 if airport in accepted else 0) for airport in active_airports}
 
 
-def inf_est_batched(spark_session, graph_bc, airports, n, epsilon, max_epochs, avg_out_degree, node_size):
-    """Runs InfEst for all airports at once: at every level"""
+def inf_est_batched(spark_session, graph_bc, airports, n, epsilon, max_epochs, n_samples=None):
+    """Runs InfEst for all airports at once"""
     results = {}
     active_airports = set(airports)
-    total_airports = len(airports)
+    total_airports = n
     tau = n
 
     while active_airports and tau >= 1:
         verified = verify_guess_batched(
-            spark_session, graph_bc, list(active_airports), n, tau, epsilon, max_epochs, avg_out_degree, node_size
+            spark_session, graph_bc, list(active_airports), n, tau, epsilon, max_epochs, n_samples
         )
 
         for airport, is_accepted in verified.items():
@@ -171,7 +162,7 @@ def inf_est_batched(spark_session, graph_bc, airports, n, epsilon, max_epochs, a
 
 
 def main():
-    """Main function to run the training script."""
+    """Main function to run the influence estimation"""
     setup_logging()
 
     spark_session = create_spark_session(app_name="Training")
@@ -190,9 +181,10 @@ def main():
         .option("inferSchema", "true")\
         .load(file)
 
+    n_samples = config["influence"]["n_samples"] if config["influence"]["fixed_samples"] else None
+
     graph = create_graph(data)
     graph_broadcast = spark_session.sparkContext.broadcast(graph)
-    avg_out_degree = compute_avg_out_degree(graph)
 
     n = len(graph_broadcast.value)
     airports = list(graph_broadcast.value.keys())
@@ -202,11 +194,9 @@ def main():
         len(airports)
     )
 
-    node_size = len(pickle.dumps((("ATL", 0, "ORD"), "new")))
-
     influence_scores = inf_est_batched(
         spark_session, graph_broadcast, airports, n, EPSILON,
-        max_epochs=MAX_EPOCHS, avg_out_degree=avg_out_degree, node_size=node_size
+        MAX_EPOCHS, n_samples=n_samples
     )
 
     logger.info("Finished influence estimation for %d airports", len(influence_scores))
