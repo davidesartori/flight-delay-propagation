@@ -324,7 +324,7 @@ class TestInfEst:
         """tau is divided by (1 + epsilon) after each rejection."""
         seen = []
 
-        def fake_verify(sc, graph_bc, starting_nodes, tau, epsilon):
+        def fake_verify(sc, graph_bc, starting_nodes, tau, epsilon, n_samples=None):
             seen.append(tau)
             return len(seen) == 3  # accept on the third guess
 
@@ -341,7 +341,7 @@ class TestInfEst:
         seen = []
         monkeypatch.setattr(
             inf, "verify_guess",
-            lambda sc, bc, s, tau, eps: seen.append(tau) or False,
+            lambda sc, bc, s, tau, eps, n_samples: seen.append(tau) or False,
         )
         inf.inf_est(None, fake_bc(toy_graph), ["A", "B"], epsilon=0.1)
         assert all(tau >= 2 for tau in seen)

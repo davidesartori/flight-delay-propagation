@@ -49,13 +49,13 @@ def sample_oracle(graph, starting_nodes, l, t):
     return hits / l
 
 
-def verify_guess(graph, starting_nodes, tau, epsilon):
+def verify_guess(graph, starting_nodes, tau, epsilon, n_samples=None):
     """Return True if the guess tau of the influence of starting_nodes is accepted"""
     n = len(graph)
     t = tau
     total = 0.0
     while t <= n:
-        l = max(10, int(round(8 * t * (math.log(n) ** 3) / (epsilon ** 2 * tau))))
+        l = max(10, int(round(8 * t * (math.log(n) ** 3) / (epsilon ** 2 * tau)))) if n_samples is None else n_samples
         pi_t = sample_oracle(graph, starting_nodes, l, int(round(t)))
         total += (epsilon / (1 + epsilon)) * t * pi_t
         if total >= (1 - 2 * epsilon) * tau:
@@ -64,12 +64,12 @@ def verify_guess(graph, starting_nodes, tau, epsilon):
     return False
 
 
-def inf_est(graph, starting_nodes, epsilon):
+def inf_est(graph, starting_nodes, epsilon, n_samples=None):
     """Estimate the influence of starting_nodes"""
     n = len(graph)
     tau = n
     while tau >= len(starting_nodes):
-        if verify_guess(graph, starting_nodes, tau, epsilon):
+        if verify_guess(graph, starting_nodes, tau, epsilon, n_samples):
             return tau
         tau /= 1 + epsilon
     return 1
@@ -97,10 +97,12 @@ def main():
 
     logger.info("Starting influence estimation for %d airports", len(airports))
 
+    n_samples = config["influence"].get("n_samples", None) if config["influence"].get("fixed_samples", False) else None
+
     influence_scores = {}
     for airport in airports:
         try:
-            score = inf_est(graph, [airport], EPSILON)
+            score = inf_est(graph, [airport], EPSILON, n_samples)
             influence_scores[airport] = score
             logger.info("Airport: %s, Influence Score: %s (%d/%d)",
                         airport, score, len(influence_scores), n)

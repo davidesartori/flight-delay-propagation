@@ -1,5 +1,7 @@
 """Module for computing simulation statistics."""
 
+from pyspark.sql import functions as F
+
 
 def get_magnitude(flight_info_bc, state_rdd, t: int):
     """Calculate the magnitude of delays at each airport."""
@@ -30,100 +32,121 @@ def get_speed(magnitude_rdd, n_total_airports: int):
     return total / n_total_airports if n_total_airports > 0 else 0
 
 
-def compute_simulation_stats(final_state_rdd, flight_info_bc, influence_scores, top_n=20):
-    """Computes various statistics from the final state of the simulation."""
+def top_airports_by_delay(df, airport_col, delay_col, top_n=10, min_flights=5):
+    """Ranks airports by total delay (only delays >= 1 min count toward the total)."""
+    ranking = (
+        df.groupBy(airport_col)
+          .agg(
+              F.count("*").alias("n_flights"),
+              F.count(F.when(F.col(delay_col) >= 15, 1)).alias("n_delayed"),
+              F.sum(F.when(F.col(delay_col) >= 15, F.col(delay_col)).otherwise(0)).alias("total_delay"),
+              F.count(F.when(F.col(delay_col) >= 60, 1)).alias("n_delays_gt_60"),
+              F.count(F.when(F.col(delay_col) >= 120, 1)).alias("n_delays_gt_120"),
+              F.count(F.when(F.col(delay_col) >= 200, 1)).alias("n_delays_gt_200"),
+              F.count(F.when(F.col(delay_col) >= 250, 1)).alias("n_delays_gt_250"),
+              F.count(F.when(F.col(delay_col) >= 300, 1)).alias("n_delays_gt_300"),
+              F.count(F.when(F.col(delay_col) >= 400, 1)).alias("n_delays_gt_400"),
+              F.avg(delay_col).alias("avg_delay"),
+              F.max(delay_col).alias("max_delay"),
+          )
+          .filter(F.col("n_flights") >= min_flights)
+          .orderBy(F.col("total_delay").desc())
+          .limit(top_n)
+          .collect()
+    )
+    return [
+        {
+            "airport": r[airport_col],
+            "n_flights": r["n_flights"],
+            "n_delayed": r["n_delayed"],
+            "total_delay": r["total_delay"],
+            "n_delays_gt_60": r["n_delays_gt_60"],
+            "n_delays_gt_120": r["n_delays_gt_120"],
+            "n_delays_gt_200": r["n_delays_gt_200"],
+            "n_delays_gt_250": r["n_delays_gt_250"],
+            "n_delays_gt_300": r["n_delays_gt_300"],
+            "n_delays_gt_400": r["n_delays_gt_400"],
+            "avg_delay": float(r["avg_delay"]),
+            "max_delay": r["max_delay"],
+        }
+        for r in ranking
+    ]
 
-    departed = final_state_rdd.filter(lambda item: item[1]["is_departed"])
-    not_departed_count = final_state_rdd.filter(
-        lambda item: not item[1]["is_departed"]
-    ).count()
 
-    def to_record(item):
-        flight_id, state = item
-        destination = flight_info_bc.value[flight_id]["destination"]
-        return (flight_id, state["scheduled_arrival"] - (state["scheduled_departure"] + flight_info_bc.value[flight_id]["scheduled_flying_time"]), destination)
+def compute_simulation_stats(stat_df, influence_scores, top_n=20):
+    """Computes statistics from the results DataFrame."""
+    not_departed_count = stat_df.filter(F.col("actual_departure").isNull()).count()
 
-    records = departed.map(to_record)
-    records.cache()
+    df = (stat_df
+        .filter(F.col("actual_arrival").isNotNull())
+        .withColumn("delay", F.col("actual_arrival") - F.col("scheduled_arrival"))
+        .withColumn("departure_delay",
+                    F.col("actual_departure") - F.col("scheduled_departure"))
+        .cache())
 
-    n_departed = records.count()
-
+    n_departed = df.count()
     if n_departed == 0:
         return empty_stats(not_departed_count)
 
-    delayed_only = records.filter(lambda r: r[1] >= 1)
-    delayed_only.cache()
+    thresholds = [60, 120, 200, 250, 300, 400]
+    agg = df.agg(
+        F.sum(F.when(F.col("delay") >= 1, F.col("delay")).otherwise(0)).alias("total_delay"),
+        F.count(F.when(F.col("delay") >= 1, 1)).alias("n_delayed"),
+        F.max("delay").alias("max_delay"),
+        *[F.count(F.when(F.col("delay") >= th, 1)).alias(f"gt_{th}") for th in thresholds],
+    ).first()
 
-    delays_gt_60 = delayed_only.filter(lambda r: r[1] >= 60).count()
-    delays_gt_120 = delayed_only.filter(lambda r: r[1] >= 120).count()
-    delays_gt_200 = delayed_only.filter(lambda r: r[1] >= 200).count()
-    delays_gt_250 = delayed_only.filter(lambda r: r[1] >= 250).count()
-    delays_gt_300 = delayed_only.filter(lambda r: r[1] >= 300).count()
-    delays_gt_400 = delayed_only.filter(lambda r: r[1] >= 400).count()
+    total_delay = agg["total_delay"] or 0
+    n_delayed = agg["n_delayed"]
 
-    total_delay = delayed_only.map(lambda r: r[1]).sum()
-    n_delayed = delayed_only.count()
+    all_delays_sorted = sorted(r["delay"] for r in df.select("delay").collect())
+    percentiles = {f"p{p}": percentile(all_delays_sorted, p) for p in [50, 75, 90, 95, 99]}
 
-    avg_delay = total_delay / n_departed if n_departed > 0 else 0
-    avg_delay_delayed = total_delay / n_delayed if n_delayed > 0 else 0
+    ranked = sorted(influence_scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_airports = [a for a, _ in ranked[:top_n]]
 
-    all_delays_sorted = sorted(records.map(lambda r: r[1]).collect())
-    median_delay = percentile(all_delays_sorted, 50)
-
-    percentiles = {
-        f"p{p}": percentile(all_delays_sorted, p)
-        for p in [50, 75, 90, 95, 99]
-    }
-    max_delay = all_delays_sorted[-1] if all_delays_sorted else 0
-
-    ranked_airports = sorted(influence_scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_airports = set(a for a, _ in ranked_airports[:top_n])
-    top_airports_bc = records.context.broadcast(top_airports)
-
-    top_records = records.filter(lambda r: r[2] in top_airports_bc.value)
-    top_records.cache()
-    n_top = top_records.count()
+    top_df = df.filter(F.col("destination").isin(top_airports))
+    top_delays_sorted = sorted(r["delay"] for r in top_df.select("delay").collect())
+    n_top = len(top_delays_sorted)
 
     if n_top > 0:
-        top_delays_sorted = sorted(top_records.map(lambda r: r[1]).collect())
         top_avg_delay = sum(top_delays_sorted) / n_top
         top_median_delay = percentile(top_delays_sorted, 50)
         top_total_delay = sum(d for d in top_delays_sorted if d >= 1)
     else:
         top_avg_delay = top_median_delay = top_total_delay = 0
 
-    influence_bc_local = records.context.broadcast(influence_scores)
+    weights = df.sparkSession.createDataFrame(
+        [(k, float(v)) for k, v in influence_scores.items()],
+        "destination string, influence double",
+    )
+    
+    total_weighted_delay = (
+        df.filter(F.col("delay") >= 1)
+          .join(weights, "destination", "left")
+          .agg(F.sum(F.col("delay") * F.coalesce(F.col("influence"), F.lit(0))))
+          .first()[0] or 0
+    )
 
-    def weighted_delay(r):
-        _, delay, destination = r
-        if delay < 1:
-            return 0.0
-        influence = influence_bc_local.value.get(destination, 0)
-        return delay * influence
-
-    total_weighted_delay = records.map(weighted_delay).sum()
+    top_delays = top_airports_by_delay(df, "origin", "departure_delay", top_n=top_n)
 
     return {
         "total_delay": total_delay,
         "n_delayed_flights": n_delayed,
-        "n_delays_gt_60": delays_gt_60,
-        "n_delays_gt_120": delays_gt_120,
-        "n_delays_gt_200": delays_gt_200,
-        "n_delays_gt_250": delays_gt_250,
-        "n_delays_gt_300": delays_gt_300,
-        "n_delays_gt_400": delays_gt_400,
+        **{f"n_delays_gt_{th}": agg[f"gt_{th}"] for th in thresholds},
         "n_departed_flights": n_departed,
         "n_not_departed": not_departed_count,
-        "avg_delay": avg_delay,
-        "avg_delay_delayed": avg_delay_delayed,
-        "median_delay": median_delay,
+        "avg_delay": total_delay / n_departed,
+        "avg_delay_delayed": total_delay / n_delayed if n_delayed > 0 else 0,
+        "median_delay": percentiles["p50"],
         "percentiles": percentiles,
-        "max_delay": max_delay,
+        "max_delay": agg["max_delay"],
         "n_top_airport_flights": n_top,
         "top_avg_delay": top_avg_delay,
         "top_median_delay": top_median_delay,
         "top_total_delay": top_total_delay,
         "total_weighted_delay": total_weighted_delay,
+        "top_delays": top_delays,
     }
 
 
@@ -139,10 +162,13 @@ def empty_stats(not_departed_count: int):
     """Returns stats when no flight is departed"""
     empty_percentiles = {f"p{p}": 0 for p in [50, 75, 90, 95, 99]}
     return {
-        "total_delay": 0, "n_delayed_flights": 0, "n_departed_flights": 0,
+        "total_delay": 0, "n_delayed_flights": 0,
+        **{f"n_delays_gt_{th}": 0 for th in [60, 120, 200, 250, 300, 400]},
+        "n_departed_flights": 0,
         "n_not_departed": not_departed_count, "avg_delay": 0,
         "avg_delay_delayed": 0, "median_delay": 0,
         "percentiles": empty_percentiles, "max_delay": 0,
         "n_top_airport_flights": 0, "top_avg_delay": 0,
         "top_median_delay": 0, "top_total_delay": 0, "total_weighted_delay": 0,
+        "top_delays": [],
     }

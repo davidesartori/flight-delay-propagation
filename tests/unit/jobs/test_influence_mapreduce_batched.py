@@ -1,4 +1,4 @@
-"""Testing module for batched influence job"""
+"""Testing module for batched MapReduce influence job"""
 import math
 import random
 from types import SimpleNamespace
@@ -176,8 +176,8 @@ class TestSampleOracleBatched:
         result = inf.sample_oracle_batched(
             spark, bc, ["A", "D"], l=5, t=3, max_epochs=3
         )
-        assert result["A"] == pytest.approx(1.0)   # A -> B -> C
-        assert result["D"] == pytest.approx(0.0)   # D is a sink
+        assert result["A"] == pytest.approx(1.0)
+        assert result["D"] == pytest.approx(0.0)
 
 
 class TestVerifyGuessBatched:
@@ -242,7 +242,7 @@ class TestVerifyGuessBatched:
             None, fake_bc(toy_graph), ["A"], n=3, tau=1,
             epsilon=inf.EPSILON, max_epochs=3,
         )
-        # Rejecting would require scanning t up to n
+
         assert len(calls) < 12
 
     def test_n_samples_overrides_l(self, monkeypatch, toy_graph):
@@ -345,7 +345,6 @@ class TestInfEstBatched:
         )
 
         assert result == {"A": 1, "B": 1}
-        # tau goes 3, 3/1.1, ... and stops once it drops below 1 (12 guesses for n=3).
         assert len(calls) == 12
         assert all(tau >= 1 for tau in calls)
 
@@ -369,7 +368,7 @@ class TestInfEstBatched:
         assert result["A"] == 3
         assert result["B"] == pytest.approx(3 / 1.1 ** 2)
         assert [airports for _, airports in calls] == [{"A", "B"}, {"B"}, {"B"}]
-        assert len(calls) == 3  # loop stops as soon as nobody is active
+        assert len(calls) == 3
 
     def test_mixed_accepted_and_fallback(self, monkeypatch, toy_graph):
         """Accepted airports keep their tau, rejected ones fall back to 1."""

@@ -3,7 +3,8 @@ input:
   influence: "dataset/influence_scores.csv"
 
 output:
-  simulation: "output/sim_result.txt"
+  stats: "output/sim_stats.txt"
+  simulation: "output/sim_flights.csv"
   training: "output/influence_scores.csv"
 
 influence:

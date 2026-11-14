@@ -136,8 +136,6 @@ def main():
             .option("inferSchema", "true")
             .load(config["input"]["flights"]))
 
-    n_samples = config["influence"]["n_samples"] if config["influence"]["fixed_samples"] else None
-
     graph = create_graph(data)
     graph_broadcast = spark_session.sparkContext.broadcast(graph)
 
@@ -145,6 +143,8 @@ def main():
     airports = list(graph_broadcast.value.keys())
 
     logger.info("Starting influence estimation for %d airports", len(airports))
+
+    n_samples = config["influence"].get("n_samples", None) if config["influence"].get("fixed_samples", False) else None
 
     influence_scores = {}
     for airport in airports:

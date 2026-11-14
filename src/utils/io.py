@@ -23,3 +23,12 @@ def save_output(path: str, text: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="\n", encoding="utf-8") as f:
         f.write(text)
+
+
+def save_dataframe_csv(df, path):
+    """Write a Spark DataFrame to a single local CSV file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(df.columns)
+        writer.writerows(df.collect())

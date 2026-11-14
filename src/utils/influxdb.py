@@ -1,4 +1,5 @@
 """Module for writing data to InfluxDB."""
+import datetime
 import os
 import logging
 import requests
@@ -87,7 +88,7 @@ class InfluxDBService:
         )
 
 
-def row_to_point(row, measurement: str, tag_cols: list[str], field_cols: list[str], time_col: str) -> Point:
+def row_to_point(row, measurement, tag_cols, field_cols, time_col):
     """Converts a row to an InfluxDB Point."""
     p = Point(measurement)
     for tag in tag_cols:
@@ -95,7 +96,10 @@ def row_to_point(row, measurement: str, tag_cols: list[str], field_cols: list[st
     for field in field_cols:
         p = p.field(field, getattr(row, field))
     if time_col:
-        p = p.time(getattr(row, time_col))
+        ts = getattr(row, time_col)
+        if isinstance(ts, datetime.datetime) and ts.tzinfo is None:
+            ts = ts.astimezone()
+        p = p.time(ts)
     return p
 
 def write_partition(rows, measurement: str, tag_cols: list[str], field_cols: list[str], time_col: str):

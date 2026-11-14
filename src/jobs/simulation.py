@@ -10,13 +10,14 @@ import airportsdata
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark import StorageLevel
-from src.utils.io import load__influence_scores, save_output
+from src.utils.io import load__influence_scores, save_dataframe_csv, save_output
 from src.utils.spark import create_spark_session
 from src.utils.logging import setup_logging
 from src.utils.influxdb import InfluxDBService
 from src.simulation.delay_generator import generate_random_delay_files
 from src.simulation.delay_stream import start_delay_stream, consume_pending_delays
 from src.simulation.simulation_stats import get_magnitude, get_speed, compute_simulation_stats
+from src.simulation.common import convert_minutes_to_hhmm
 
 logger = logging.getLogger(__name__)
 
@@ -25,21 +26,7 @@ DEFAULT_TURNAROUND = 45  # plane turnaround time
 CHECKPOINT_EVERY = 60
 T_START = 0
 T_MAX = 2880  # 2 days in minutes
-
-
-def parse_hhmm_to_minutes(col):
-    """Parse HHMM time format to minutes since midnight."""
-    s = F.lpad(col.cast("string"), 4, "0")
-    hh = F.substring(s, 1, 2).cast("int")
-    mm = F.substring(s, 3, 2).cast("int")
-    return (hh % 24) * 60 + mm
-
-
-def convert_minutes_to_hhmm(minutes: int):
-    """Convert minutes since midnight to HHMM time format."""
-    hh = (minutes // 60) % 24
-    mm = minutes % 60
-    return f"{hh:02d}:{mm:02d}"
+EXPONENT = 2  # exponent for influence weighting in priority calculation
 
 
 def minutes_to_timestamp(minutes: int, base_date: datetime, seconds=0) -> datetime:
@@ -47,23 +34,22 @@ def minutes_to_timestamp(minutes: int, base_date: datetime, seconds=0) -> dateti
     return base_date.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=minutes, seconds=seconds)
 
 
-def convert_to_central(hhmm, airport, airport_tz, year, month, day):
-    """Convert an airport local HHMM time to Central Time.""" 
-    if hhmm is None or airport not in airport_tz:
-        return hhmm
-    hhmm = str(int(hhmm)).zfill(4)
-    hour = int(hhmm[:2])
-    minute = int(hhmm[2:])
-    local_dt = datetime(year, month, day, hour, minute, tzinfo=ZoneInfo(airport_tz[airport]))
-    central_dt = local_dt.astimezone(ZoneInfo("America/Chicago"))
-
-    return central_dt.hour * 100 + central_dt.minute
+def convert_to_central_minutes(hhmm, airport, airport_tz, year, month, day):
+    """Convert a local HHMM time to minutes since midnight (Central) of the base day"""
+    if hhmm is None:
+        return None
+    hour, minute = divmod(int(hhmm), 100)
+    tz = ZoneInfo(airport_tz.get(airport, "America/Chicago"))
+    local_dt = (datetime(year, month, day, tzinfo=tz)
+                + timedelta(hours=hour, minutes=minute))
+    central_midnight = datetime(year, month, day, tzinfo=ZoneInfo("America/Chicago"))
+    return int((local_dt - central_midnight).total_seconds() // 60)
 
 
 def convert_to_central_udf(airport_tz_bc, year, month, day):
-    """Create a Spark UDF for Central Time conversion."""
+    """Create a Spark UDF for Central Time conversion (minutes since Central midnight)."""
     return F.udf(lambda hhmm, airport:
-                 convert_to_central(hhmm, airport, airport_tz_bc.value, year, month, day), "int")
+                 convert_to_central_minutes(hhmm, airport, airport_tz_bc.value, year, month, day), "int")
 
 
 def process_raw_flights(spark_session, raw_df, year, month, day):
@@ -84,8 +70,10 @@ def process_raw_flights(spark_session, raw_df, year, month, day):
     )
 
     day_df = day_df.withColumn(
-        "scheduled_departure", parse_hhmm_to_minutes(
-            convert_to_central_udf(airport_tz_bc, year, month, day)( F.col("SCHEDULED_DEPARTURE"), F.col("ORIGIN_AIRPORT")))
+        "scheduled_departure",
+            convert_to_central_udf(airport_tz_bc, year, month, day)( F.col("SCHEDULED_DEPARTURE"), F.col("ORIGIN_AIRPORT"))
+    ).filter(
+        F.col("scheduled_departure") >= 0
     ).withColumn(
         "scheduled_flying_time", F.col("SCHEDULED_TIME").cast("int")
     ).withColumn(
@@ -149,13 +137,40 @@ def build_info_and_state(flights_df, spark_session):
     return flight_info_bc, state_rdd
 
 
+def get_simulation_results_dataframe(spark_session, state_rdd, flight_info_bc):
+    """Convert the final state RDD to a DataFrame for further analysis or saving."""
+    results_rdd = state_rdd.map(lambda flight: (
+        flight[0],
+        flight_info_bc.value[flight[0]]["tail_number"],
+        flight_info_bc.value[flight[0]]["origin"],
+        flight_info_bc.value[flight[0]]["destination"],
+        flight_info_bc.value[flight[0]]["scheduled_departure"],
+        flight[1].get("departure_time"),
+        flight_info_bc.value[flight[0]]["scheduled_departure"]
+        + flight_info_bc.value[flight[0]]["scheduled_flying_time"],
+        flight[1].get("departure_time") + flight_info_bc.value[flight[0]]["scheduled_flying_time"]
+        if flight[1]["is_departed"] else None
+    ))
+
+    results_df = spark_session.createDataFrame(results_rdd, schema=[
+        "flight_id", "tail_number", "origin", "destination",
+        "scheduled_departure", "actual_departure", "scheduled_arrival", "actual_arrival"
+    ])
+
+    return results_df
+
+
 def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t_end=1440, use_influence=False, influence_rate=1,
                    use_delay_streaming=False, delay_streaming_dir="delay_streaming", delay_interval_sec=10, delay_probability=0.001,
                    delay_range=(5, 30), influxdb_client:InfluxDBService=None, write_events=True, enable_checkpoint=True):
     """Run the flight delay propagation simulation."""
+    scores = list(influence_score_map.values())
+    inf_min = min(scores, default=1)
+    inf_range = (max(scores, default=1) - inf_min) or 1
+
     def resolve_group(item, t):
         _, flights = item
-        flights = list(flights)
+        flights = sorted(flights, key=lambda fs: fs[0])
 
         def priority_key(fs):
             flight_id, state = fs
@@ -165,7 +180,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             delay = state["delay"]
             priority = delay if delay > 0 else 1
             if influence > 0 and delay > 0:
-                priority *= (1 + influence_rate * ((influence - 1) / 99)**2)
+                priority *= (1 + influence_rate * ((influence - inf_min) / inf_range)**EXPONENT)
             return priority
 
         winner_id, _ = max(flights, key=priority_key)
@@ -190,16 +205,18 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
                                                      "ready_time": t + info["scheduled_flying_time"] + DEFAULT_TURNAROUND}))
             else:
                 new_state = dict(state)
-                additional_delay = 1 if FLIGHT_SEPARATION <= 6 else 0
                 new_state["delay"] = max(
-                    0, FLIGHT_SEPARATION + t - (state["scheduled_departure"] + state["delay"])) + additional_delay
+                    0,
+                    t + FLIGHT_SEPARATION + min(FLIGHT_SEPARATION - 1, 5) -
+                    (state["scheduled_departure"] + state["delay"])
+                )
                 updates.append((flight_id, new_state))
 
         return updates
 
     def resolve_landing_group(item):
         _, flights = item
-        flights = list(flights)
+        flights = sorted(flights, key=lambda fs: fs[0])
         updates = []
 
         def priority_key(fs):
@@ -216,7 +233,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
                 priority = delay if delay > 0 else 1
                 if influence > 0 and delay > 0:
                     priority *= (1 + influence_rate *
-                                 ((influence - 1) / 99)**2)
+                                 ((influence - inf_min) / inf_range)**EXPONENT)
 
             return priority
 
@@ -292,12 +309,13 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
 
     t = t0
 
-    influxdb_client.write_point(
-        measurement="control",
-        tags={"type": "info"},
-        fields={"message": "Control panel started"},
-        time=minutes_to_timestamp(t, date)
-    )
+    if influxdb_client:
+        influxdb_client.write_point(
+            measurement="control",
+            tags={"type": "info"},
+            fields={"message": "Control panel started"},
+            time=minutes_to_timestamp(t, date)
+        )
 
     not_departed = state_rdd.filter(
         lambda flight: flight[1]["is_departed"] is False)
@@ -320,16 +338,19 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
                             flight[1]["scheduled_departure"] + flight[1]["delay"] <= t + delay and
                             flight[1]["scheduled_departure"] + flight[1]["delay"] >= t)
 
-                    if affected_flights.count() > 0:
-                        logger.info("Applying delay of %d minutes to %d flights at airport %s at time %s",
-                                    delay, affected_flights.count(), airport, convert_minutes_to_hhmm(t))
+                    affected_flights_count = affected_flights.count()
 
-                        influxdb_client.write_point(
-                            measurement="events",
-                            tags={},
-                            fields={"message": f"Applying delay of {delay} minutes to {affected_flights.count()} flights at airport {airport} at time {convert_minutes_to_hhmm(t)}"},
-                            time=minutes_to_timestamp(t, date)
-                        )
+                    if affected_flights_count > 0:
+                        logger.info("Applying delay of %d minutes to %d flights at airport %s at time %s",
+                                    delay, affected_flights_count, airport, convert_minutes_to_hhmm(t))
+
+                        if influxdb_client:
+                            influxdb_client.write_point(
+                                measurement="events",
+                                tags={"airport": airport},
+                                fields={"message": f"Applying delay of {delay} minutes to {affected_flights_count} flights at airport {airport} at time {convert_minutes_to_hhmm(t)}"},
+                                time=minutes_to_timestamp(t, date)
+                            )
 
                         affected_flights = affected_flights.map(lambda flight, delay=delay: (
                                 flight[0], {
@@ -337,6 +358,7 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
                                     "delay": (t + delay) - (flight[1]["scheduled_departure"] + flight[1]["delay"]),
                                 }))
 
+                        state_rdd = state_rdd.subtractByKey(affected_flights).union(affected_flights)
                         not_departed = not_departed.subtractByKey(affected_flights).union(affected_flights)
 
         # departures
@@ -359,21 +381,21 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             resolutions = [
                 {
                     "measurement": "control",
-                    "tags": {"type": "resolution"},
+                    "tags": {"type": "resolution", "airport": flight_info_bc.value[resolved_flight_id]["origin"]},
                     "fields": {
                         "message": f"Departure conflict: prioritizing flight {resolved_flight_id} at airport {flight_info_bc.value[resolved_flight_id]['origin']}"
                     },
-                    "time": minutes_to_timestamp(t, date, 0)
+                    "time": minutes_to_timestamp(t, date)
                 }
                 for resolved_flight_id in resolved_flight_ids
             ]
             influxdb_client.write_points(resolutions)
 
             if not winner_flights.isEmpty():
-                departed_flights_messages_rdd = winner_flights.map(lambda flight: (f"{flight_info_bc.value[flight[0]]['origin']} -> {flight_info_bc.value[flight[0]]['destination']} | Departed at {convert_minutes_to_hhmm(t)} with delay of {flight[1]['delay']} minutes", minutes_to_timestamp(t, date)))
-                departed_flights_messages_df = spark_session.createDataFrame(departed_flights_messages_rdd, schema=["message", "timestamp"])
+                departed_flights_messages_rdd = winner_flights.map(lambda flight: (flight_info_bc.value[flight[0]]['origin'], f"{flight_info_bc.value[flight[0]]['origin']} -> {flight_info_bc.value[flight[0]]['destination']} | Departed with delay of {flight[1]['delay']} minutes", minutes_to_timestamp(t, date)))
+                departed_flights_messages_df = spark_session.createDataFrame(departed_flights_messages_rdd, schema=["airport", "message", "timestamp"])
 
-                influxdb_client.write_dataframe(departed_flights_messages_df, measurement="events", tag_cols=[], field_cols=["message"], time_col="timestamp")
+                influxdb_client.write_dataframe(departed_flights_messages_df, measurement="events", tag_cols=["airport"], field_cols=["message"], time_col="timestamp")
 
         # arrivals
         landing_conflicts = state_rdd.filter(lambda flight: flight[1]["is_departed"] is True and
@@ -392,11 +414,11 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             resolutions = [
                 {
                     "measurement": "control",
-                    "tags": {"type": "resolution"},
+                    "tags": {"type": "resolution", "airport": flight_info_bc.value[resolved_flight_id]['destination']},
                     "fields": {
                         "message": f"Arrival conflict: prioritizing flight {resolved_flight_id} at airport {flight_info_bc.value[resolved_flight_id]['destination']}"
                     },
-                    "time": minutes_to_timestamp(t, date, 0)
+                    "time": minutes_to_timestamp(t, date)
                 }
                 for resolved_flight_id in resolved_flight_ids
             ]
@@ -414,12 +436,13 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             dp_mag1, dp_mag2 = get_magnitude(flight_info_bc, state_rdd, t)
             dp_spe = get_speed(dp_mag1, n_total_airports)
 
-            influxdb_client.write_point(
-                measurement="dp_spe",
-                tags={},
-                fields={"speed": dp_spe},
-                time=minutes_to_timestamp(t, date)
-            )
+            if influxdb_client:
+                influxdb_client.write_point(
+                    measurement="dp_spe",
+                    tags={},
+                    fields={"speed": dp_spe},
+                    time=minutes_to_timestamp(t, date)
+                )
 
             magnitude1_at_t = dp_mag1.mapValues(
                 lambda magnitude, t=t: (t, magnitude)
@@ -447,8 +470,9 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
             if(not dp_mag1.isEmpty() and not dp_mag2.isEmpty()):
                 dp_mag1 = spark_session.createDataFrame(dp_mag1, schema=["timestamp", "origin", "delay_count"])
                 dp_mag2 = spark_session.createDataFrame(dp_mag2, schema=["timestamp", "origin", "delay_time"])
-                influxdb_client.write_dataframe(dp_mag1, measurement="dp_mag1", tag_cols=["origin"], field_cols=["delay_count"], time_col="timestamp")
-                influxdb_client.write_dataframe(dp_mag2, measurement="dp_mag2", tag_cols=["origin"], field_cols=["delay_time"], time_col="timestamp")
+                if influxdb_client:
+                    influxdb_client.write_dataframe(dp_mag1, measurement="dp_mag1", tag_cols=["origin"], field_cols=["delay_count"], time_col="timestamp")
+                    influxdb_client.write_dataframe(dp_mag2, measurement="dp_mag2", tag_cols=["origin"], field_cols=["delay_time"], time_col="timestamp")
 
         not_departed = state_rdd.filter(
             lambda flight: flight[1]["is_departed"] is False)
@@ -458,15 +482,33 @@ def run_simulation(spark_session, flights_df, influence_score_map, date, t0=0, t
         
         t += 1
 
-    influxdb_client.close()
-
     if use_delay_streaming:
         stop_event.set()
         stream_query.stop()
 
-    simulation_stats = compute_simulation_stats(state_rdd, flight_info_bc, influence_score_map)
+    sim_result_df = get_simulation_results_dataframe(spark_session, state_rdd, flight_info_bc)
+    sim_result_df = sim_result_df.orderBy("tail_number", "scheduled_departure")
+    simulation_stats = compute_simulation_stats(sim_result_df, influence_score_map)
 
-    return state_rdd, simulation_stats
+    return state_rdd, simulation_stats, sim_result_df
+
+
+def format_airport_ranking(title, ranking):
+    """Format a ranking of airports as a text table."""
+    lines = [
+        f"--- {title} ---",
+        f"{'Airport':<8}{'Flights':>8}{'Delayed':>9}{'Total':>10}{'Delayed (>= 60 min)':>25}"
+        f"{'Delayed (>= 120 min)':>25}{'Delayed (>= 200 min)':>25}{'Delayed (>= 250 min)':>25}"
+        f"{'Delayed (>= 300 min)':>25}{'Delayed (>= 400 min)':>25}{'Avg':>8}{'Max':>6}",
+    ]
+    for r in ranking:
+        lines.append(
+            f"{r['airport']:<8}{r['n_flights']:>8}{r['n_delayed']:>9}"
+            f"{r['total_delay']:>10}{r['n_delays_gt_60']:>25}{r['n_delays_gt_120']:>25}"
+            f"{r['n_delays_gt_200']:>25}{r['n_delays_gt_250']:>25}{r['n_delays_gt_300']:>25}"
+            f"{r['n_delays_gt_400']:>25}{r['avg_delay']:>8.1f}{r['max_delay']:>6}"
+        )
+    return "\n".join(lines)
 
 
 def save_stats(path, stats, label):
@@ -493,7 +535,14 @@ def save_stats(path, stats, label):
         f"Average delay:                        {stats['top_avg_delay']:.2f} minutes\n"
         f"Median delay:                         {stats['top_median_delay']:.1f} minutes\n"
         f"Total delay:                          {stats['top_total_delay']:.1f} minutes\n"
-        f"Influence-weighted total delay:       {stats['total_weighted_delay']:.1f}"
+        f"Influence-weighted total delay:       {stats['total_weighted_delay']:.1f}\n\n"
+    )
+
+    output += (
+        f"=== System Delay Statistics {label} ===\n"
+        f"Influence-weighted total delay:       {stats['total_weighted_delay']:.1f}\n\n"
+        + format_airport_ranking(
+            "Top origin airports by departure delay", stats["top_delays"])
     )
 
     save_output(path, output)
@@ -520,9 +569,6 @@ def main():
     raw_flights_df = spark_session.read.csv(
         config["input"]["flights"], header=True, inferSchema=True)
 
-    flights_df = process_raw_flights(spark_session, raw_flights_df, year=2015, month=8, day=2)
-    flights_df = flights_df.persist()
-
     logger.info("Starting simulation")
 
     day = config["simulation"].get("day")
@@ -536,7 +582,8 @@ def main():
     delay_probability = config["delay_streaming"].get("probability", 0.001)
     delay_range = tuple(config["delay_streaming"].get("delay_range", (5, 30)))
     write_events = config["simulation"].get("write_events", True)
-    output_path = config["output"].get("simulation", "output/sim_result.txt")
+    stats_output_path = config["output"].get("stats", "output/sim_stats.txt")
+    sim_output_path = config["output"].get("simulation", "output/sim_flights.csv")
 
     influxdb_client = InfluxDBService()
 
@@ -546,19 +593,33 @@ def main():
     influxdb_client.delete_table(table="events", hard=True)
     influxdb_client.delete_table(table="control", hard=True)
 
-    final_state, simulation_stats = run_simulation(spark_session,
+    flights_df = process_raw_flights(spark_session, raw_flights_df, year=year, month=month, day=day)
+    flights_df = flights_df.persist()
+
+    final_state, simulation_stats, sim_result_df = run_simulation(spark_session,
         flights_df, influence_scores, date=datetime(year, month, day, tzinfo=ZoneInfo("America/Chicago")), t0=T_START,
         t_end=T_MAX, use_influence=use_influence, influence_rate=influence_rate,
         use_delay_streaming=use_delay_streaming, delay_streaming_dir=delay_streaming_dir,
         delay_interval_sec=delay_interval_sec, delay_probability=delay_probability,
         delay_range=delay_range, influxdb_client=influxdb_client, write_events=write_events, enable_checkpoint=True)
 
+    influxdb_client.close()
+
     remaining_flights = final_state.filter(
         lambda x: x[1]["is_departed"] is False)
 
     logger.info("Simulation completed. Remaining flights: %s", remaining_flights.count())
 
-    save_stats(output_path, simulation_stats, label="")
+    save_stats(stats_output_path, simulation_stats, label="")
+
+    cols=("scheduled_departure", "actual_departure", "scheduled_arrival", "actual_arrival")
+    
+    to_hhmm = F.udf(
+        lambda m: convert_minutes_to_hhmm(m, colon=False) if m is not None else None, "string")
+    for c in cols:
+        sim_result_df = sim_result_df.withColumn(c, to_hhmm(F.col(c)))
+        
+    save_dataframe_csv(sim_result_df, sim_output_path)
 
 
 if __name__ == "__main__":

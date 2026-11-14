@@ -170,7 +170,7 @@ class TestVerifyGuessAndInfEst:
         """tau is reduced by a factor (1 + epsilon) after each rejection."""
         seen = []
 
-        def fake_verify(graph, starting_nodes, tau, epsilon):
+        def fake_verify(graph, starting_nodes, tau, epsilon, n_samples=None):
             seen.append(tau)
             return len(seen) == 3  # accept on the third guess
 

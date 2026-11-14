@@ -65,12 +65,10 @@ services:
       - ./init/data_init.sh:/init/data_init.sh:ro
       - ./dataset:/dataset
 
-  training:
+  training-sequential:
     profiles: ["jobs"]
     build: .
     depends_on:
-      influxdb-init:
-        condition: service_completed_successfully
       data-init:
         condition: service_completed_successfully
     working_dir: /app
@@ -78,15 +76,13 @@ services:
       - .:/app
     command: >
       spark-submit
-      src/jobs/influence.py
+      src/jobs/influence_sequential.py
       --config config/config.yaml
 
-  training-fixed-samples:
+  training-sample-parallel:
     profiles: ["jobs"]
     build: .
     depends_on:
-      influxdb-init:
-        condition: service_completed_successfully
       data-init:
         condition: service_completed_successfully
     working_dir: /app
@@ -94,7 +90,35 @@ services:
       - .:/app
     command: >
       spark-submit
-      src/jobs/influence_fixed_samples.py
+      src/jobs/influence_sample_parallel.py
+      --config config/config.yaml
+
+  training-mapreduce:
+    profiles: ["jobs"]
+    build: .
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      spark-submit
+      src/jobs/influence_mapreduce.py
+      --config config/config.yaml
+
+  training-mapreduce-batched:
+    profiles: ["jobs"]
+    build: .
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >
+      spark-submit
+      src/jobs/influence_mapreduce_batched.py
       --config config/config.yaml
 
   simulation:
